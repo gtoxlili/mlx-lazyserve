@@ -23,7 +23,7 @@
         <key>MLX_LAZYSERVE_HOST</key>
         <string>0.0.0.0</string>
         <key>MLX_LAZYSERVE_PORT</key>
-        <string>11435</string>
+        <string>41434</string>
         <key>MLX_LAZYSERVE_IDLE_TIMEOUT</key>
         <string>600</string>
         <!-- Raise the Metal GPU wired-memory limit on start (reset to 0 on stop) so the

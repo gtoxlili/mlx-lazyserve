@@ -11,3 +11,6 @@ wheels/
 
 # Runtime logs
 logs/*.log
+
+# Maintenance-mode marker
+.maintenance

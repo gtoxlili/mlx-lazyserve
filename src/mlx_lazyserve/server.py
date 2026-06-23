@@ -10,7 +10,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from .config import load_settings
@@ -126,9 +126,28 @@ def _chunk(cid: str, created: int, model: str, delta: dict, finish=None) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
+def _maintenance_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": "3600"},
+        content={
+            "error": {
+                "message": "The service is paused for scheduled maintenance and is not "
+                "accepting requests right now. Please try again later.",
+                "type": "service_unavailable",
+                "code": "maintenance",
+            }
+        },
+    )
+
+
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "loaded": manager.current_name()}
+    return {
+        "status": "ok",
+        "loaded": manager.current_name(),
+        "maintenance": manager.is_paused(),
+    }
 
 
 @app.get("/v1/models")
@@ -143,9 +162,33 @@ def list_models(request: Request) -> dict:
     }
 
 
+@app.get("/admin/maintenance")
+def get_maintenance(request: Request) -> dict:
+    _require_auth(request)
+    return {"maintenance": manager.is_paused(), "loaded": manager.current_name()}
+
+
+@app.post("/admin/maintenance")
+async def set_maintenance(request: Request) -> dict:
+    """Toggle maintenance mode. Body: {"enabled": true|false}.
+
+    Enabling frees the loaded model from memory and makes inference endpoints
+    return 503; the state survives restarts via the pause-marker file.
+    """
+    _require_auth(request)
+    body = await request.json()
+    if bool(body.get("enabled")):
+        manager.pause()
+    else:
+        manager.resume()
+    return {"maintenance": manager.is_paused(), "loaded": manager.current_name()}
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     _require_auth(request)
+    if manager.is_paused():
+        return _maintenance_response()
     body = await request.json()
     model = _resolve_model(body)
     messages, images = _split_multimodal(body.get("messages") or [])

@@ -18,6 +18,7 @@ This server keeps Ollama's best ergonomic — **lazy load + idle unload** — so
 - Auto engine: tries `mlx-lm`, falls back to `mlx-vlm` for vision-language architectures
 - Optional bearer-token auth; otherwise rely on Tailscale for access control
 - Ships a `launchd` LaunchAgent for 24/7 operation
+- Maintenance mode: pause the service (free memory + reject requests) during scheduled heavy jobs
 
 ## Models
 
@@ -63,21 +64,23 @@ This is already set in the LaunchAgent plist, so the running service downloads m
 | var | default | meaning |
 |---|---|---|
 | `MLX_LAZYSERVE_HOST` | `127.0.0.1` | bind address (`0.0.0.0` or your Tailscale IP to expose) |
-| `MLX_LAZYSERVE_PORT` | `11435` | port |
+| `MLX_LAZYSERVE_PORT` | `41434` | port (high, avoids dev-server clashes) |
 | `MLX_LAZYSERVE_IDLE_TIMEOUT` | `600` | seconds idle before unloading (`0` = never) |
 | `MLX_LAZYSERVE_MAX_TOKENS` | `2048` | default max output tokens |
+| `MLX_LAZYSERVE_WIRED_LIMIT_MB` | `0` | if > 0, set Metal wired limit on start, reset on stop |
 | `MLX_LAZYSERVE_API_KEYS` | *(empty)* | comma-separated bearer tokens; empty = no auth |
 | `MLX_LAZYSERVE_MODELS` | `./models.toml` | path to the model registry |
+| `MLX_LAZYSERVE_PAUSE_FILE` | `./.maintenance` | maintenance-marker path (present = start paused) |
 
 ## API
 
 ```bash
-curl http://<tailscale-ip>:11435/v1/chat/completions \
+curl http://<tailscale-ip>:41434/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"qwen3.5-9b","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
-Point any OpenAI SDK at `http://<tailscale-ip>:11435/v1` and set the model to one of the names above.
+Point any OpenAI SDK at `http://<tailscale-ip>:41434/v1` and set the model to one of the names above.
 
 ## Run as a service (24/7)
 
@@ -107,6 +110,29 @@ sudo visudo -c    # validate
 Without the rule the service still runs (it just logs a warning and stays on the default
 cap). Manual one-off: `sudo sysctl iogpu.wired_limit_mb=22000` (resets on reboot). Keep
 `max_tokens` / context modest to bound KV-cache growth.
+
+## Maintenance mode
+
+For a scheduled heavy job (e.g. a weekend CPU task), pause the service so it gives back
+GPU/RAM and politely turns requests away:
+
+```bash
+# pause: unload the model + reject inference with HTTP 503
+curl -X POST http://<tailscale-ip>:41434/admin/maintenance \
+  -H 'Content-Type: application/json' -d '{"enabled": true}'
+
+# resume
+curl -X POST http://<tailscale-ip>:41434/admin/maintenance \
+  -H 'Content-Type: application/json' -d '{"enabled": false}'
+
+# check
+curl http://<tailscale-ip>:41434/admin/maintenance
+```
+
+While paused, `/v1/chat/completions` returns `503` with an OpenAI-style error
+(`code: "maintenance"`). The state is persisted to the pause-marker file
+(`MLX_LAZYSERVE_PAUSE_FILE`), so it survives a service restart during the window;
+`/health` reports `"maintenance": true`.
 
 ## Status / caveats
 

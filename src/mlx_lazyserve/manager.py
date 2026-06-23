@@ -28,6 +28,7 @@ class ModelManager:
         self._model = None
         self._model_name: str | None = None
         self._last_used = time.monotonic()
+        self._paused = settings.pause_file.exists()
         self._stop = threading.Event()
         if settings.idle_timeout > 0:
             threading.Thread(
@@ -37,6 +38,29 @@ class ModelManager:
     def current_name(self) -> str | None:
         with self._lock:
             return self._model_name
+
+    def is_paused(self) -> bool:
+        with self._lock:
+            return self._paused
+
+    def pause(self) -> None:
+        """Enter maintenance mode: free the loaded model and refuse new work."""
+        with self._lock:
+            self._paused = True
+            self._unload_locked()
+        try:
+            self._settings.pause_file.touch()
+        except OSError as exc:
+            logger.warning("could not write pause marker: %s", exc)
+
+    def resume(self) -> None:
+        """Leave maintenance mode and serve again."""
+        with self._lock:
+            self._paused = False
+        try:
+            self._settings.pause_file.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("could not remove pause marker: %s", exc)
 
     def _idle_reaper(self) -> None:
         timeout = self._settings.idle_timeout
@@ -57,6 +81,8 @@ class ModelManager:
             self._model_name = None
 
     def _ensure_locked(self, name: str) -> None:
+        if self._paused:
+            raise RuntimeError("service is paused (maintenance mode)")
         if self._model_name == name:
             return
         spec = self._settings.models.get(name)
