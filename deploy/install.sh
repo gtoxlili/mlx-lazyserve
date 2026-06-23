@@ -58,6 +58,7 @@ cat > "$PLIST" <<PLIST
         <key>MLX_LAZYSERVE_IDLE_TIMEOUT</key><string>${MLX_LAZYSERVE_IDLE_TIMEOUT:-600}</string>
         <key>MLX_LAZYSERVE_MAX_TOKENS</key><string>${MLX_LAZYSERVE_MAX_TOKENS:-8192}</string>
         <key>MLX_LAZYSERVE_ENABLE_THINKING</key><string>${MLX_LAZYSERVE_ENABLE_THINKING:-false}</string>
+        <key>MLX_LAZYSERVE_KV_BITS</key><string>${MLX_LAZYSERVE_KV_BITS:-0}</string>
         <key>MLX_LAZYSERVE_WIRED_LIMIT_MB</key><string>${MLX_LAZYSERVE_WIRED_LIMIT_MB:-0}</string>
         <key>MLX_LAZYSERVE_API_KEYS</key><string>${MLX_LAZYSERVE_API_KEYS:-}</string>
         <key>HF_HUB_DISABLE_XET</key><string>${HF_HUB_DISABLE_XET:-1}</string>

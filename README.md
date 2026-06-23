@@ -12,8 +12,10 @@ This server keeps Ollama's best ergonomic — **lazy load + idle unload** — so
 
 ## Features
 
-- OpenAI-compatible `POST /v1/chat/completions` (streaming + non-streaming), `GET /v1/models`, `GET /health`
+- OpenAI-compatible `POST /v1/chat/completions` (streaming + non-streaming) with real token `usage` (and `stream_options.include_usage`), `GET /v1/models`, `GET /health`
 - **Tool calling** (`tools`/`tool_choice` → `tool_calls` + `finish_reason:"tool_calls"`) and **reasoning** (`enable_thinking` → a separate `reasoning_content`), both streaming + non-streaming; parsing reuses each model's mlx-lm/mlx-vlm `tool_parsers`
+- **Structured output** (`response_format` json_object / json_schema) via `llguidance` constrained decoding — *guaranteed* valid JSON, both engines
+- Full OpenAI sampling/control: `top_k`, `min_p`, `seed`, `repetition`/`presence`/`frequency_penalty`, `logit_bias`, `stop`, plus optional quantized KV cache (`kv_bits`)
 - Lazy model load on first use; single-slot (one model resident at a time — fits 24 GB)
 - Idle unload after `IDLE_TIMEOUT` to release unified memory
 - Auto engine: tries `mlx-lm`, falls back to `mlx-vlm` for vision-language architectures
@@ -69,6 +71,7 @@ This is already set in the LaunchAgent plist, so the running service downloads m
 | `MLX_LAZYSERVE_IDLE_TIMEOUT` | `600` | seconds idle before unloading (`0` = never) |
 | `MLX_LAZYSERVE_MAX_TOKENS` | `8192` | default max output tokens (headroom for reasoning models; per-request `max_tokens` overrides) |
 | `MLX_LAZYSERVE_ENABLE_THINKING` | `false` | default thinking/reasoning state; per-request `enable_thinking` overrides |
+| `MLX_LAZYSERVE_KV_BITS` | `0` | if > 0 (e.g. `8`), quantize the KV cache → less memory / longer context, slight quality cost; per-request `kv_bits` overrides. Auto-falls-back to unquantized on sliding-window models (Gemma) that can't quantize a `RotatingKVCache` |
 | `MLX_LAZYSERVE_WIRED_LIMIT_MB` | `0` | if > 0, set Metal wired limit on start, reset on stop |
 | `MLX_LAZYSERVE_API_KEYS` | *(empty)* | comma-separated bearer tokens; empty = no auth |
 | `MLX_LAZYSERVE_MODELS` | `./models.toml` | path to the model registry |
@@ -117,6 +120,31 @@ curl http://<tailscale-ip>:41434/v1/chat/completions \
 ```
 
 Flip the server-wide default with `MLX_LAZYSERVE_ENABLE_THINKING=true`.
+
+### Structured output (`response_format`)
+
+Get **guaranteed** valid JSON via constrained decoding (an `llguidance` grammar masks every
+token that would break the schema — not best-effort prompting). Works on both engines:
+
+```bash
+curl http://<tailscale-ip>:41434/v1/chat/completions \
+  -H 'Authorization: Bearer <key>' -H 'Content-Type: application/json' \
+  -d '{"model":"gemma4-26b-uncensored","messages":[{"role":"user","content":"Invent a person."}],
+       "response_format":{"type":"json_schema","json_schema":{"name":"person","schema":
+         {"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},
+          "required":["name","age"],"additionalProperties":false}}}}'
+# -> {"name":"Elias Thorne","age":42}
+```
+
+`{"type":"json_object"}` constrains to any valid JSON object; `{"type":"json_schema",…}`
+constrains to your schema (use `additionalProperties:false` to forbid extra keys). Structured
+output forces thinking off and can't be combined with `tools` (returns 400).
+
+### Sampling & control
+
+Standard OpenAI knobs are honored: `temperature`, `top_p`, `top_k`, `min_p`, `seed`
+(reproducible), `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `logit_bias`,
+`stop` (string or list — truncates and halts), `max_tokens` / `max_completion_tokens`.
 
 ## Run as a service (24/7)
 

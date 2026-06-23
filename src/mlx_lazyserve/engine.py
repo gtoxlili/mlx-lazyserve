@@ -1,8 +1,9 @@
 """Inference engines wrapping mlx-lm and mlx-vlm behind one tiny interface.
 
-A loaded model exposes
-``.stream(messages, *, max_tokens, temperature, top_p, images=None, tools=None,
-enable_thinking=False)`` which yields **typed events**:
+A loaded model exposes ``.stream(messages, *, max_tokens, temperature, top_p,
+images=None, tools=None, enable_thinking=False, top_k, min_p, seed,
+repetition_penalty, presence_penalty, frequency_penalty, logit_bias, stop,
+response_format, kv_bits)`` which yields **typed events**:
 
     {"reasoning": str}    incremental thinking text (only when enable_thinking)
     {"content": str}      incremental answer text
@@ -42,14 +43,27 @@ def clear_mlx_cache() -> None:
             return
 
 
-def _parse_events(raw_iter, enable_thinking, tool_module, tools) -> Iterator[dict]:
+def _find_stop(text: str, stops: list[str]) -> int:
+    """Earliest index in ``text`` of any stop string, or -1."""
+    best = -1
+    for s in stops:
+        i = text.find(s)
+        if i != -1 and (best == -1 or i < best):
+            best = i
+    return best
+
+
+def _parse_events(raw_iter, enable_thinking, tool_module, tools, stop=None) -> Iterator[dict]:
     """Turn a raw text-delta iterator into typed events.
 
     Splits ``<think>…</think>`` reasoning from content (mlx-vlm's ThinkingStreamState),
-    suppresses tool-call markup from the content stream, and at the end parses tool
-    calls from the full output into OpenAI items. Degrades to plain content streaming
-    if mlx-vlm's helpers aren't importable.
+    suppresses tool-call markup from the content stream, honors ``stop`` sequences
+    (truncating + halting the underlying generator), and at the end parses tool calls
+    from the full output into OpenAI items. Degrades to plain content streaming if
+    mlx-vlm's helpers aren't importable.
     """
+    stops = [s for s in (stop or []) if s]
+
     try:
         from mlx_vlm.server.responses_state import (
             ThinkingStreamState,
@@ -57,15 +71,30 @@ def _parse_events(raw_iter, enable_thinking, tool_module, tools) -> Iterator[dic
             suppress_tool_call_content,
         )
     except Exception:  # mlx-vlm not installed (core-only) — stream plain content
+        acc = ""
         for text in raw_iter:
-            if text:
-                yield {"content": text}
+            if not text:
+                continue
+            if stops:
+                acc += text
+                idx = _find_stop(acc, stops)
+                if idx != -1:
+                    head = acc[: idx]
+                    emitted = acc[: len(acc) - len(text)]
+                    if len(head) > len(emitted):
+                        yield {"content": head[len(emitted):]}
+                    _close(raw_iter)
+                    return
+            yield {"content": text}
         return
 
     state = ThinkingStreamState(enable_thinking)
     tc_start = getattr(tool_module, "tool_call_start", None) if tool_module else None
     in_tool = False
     full = ""
+    keep = max((len(s) for s in stops), default=1) - 1  # hold-back so a split stop isn't missed
+    pending = ""
+    stopped = False
     for text in raw_iter:
         if not text:
             continue
@@ -74,11 +103,30 @@ def _parse_events(raw_iter, enable_thinking, tool_module, tools) -> Iterator[dic
         if delta.reasoning:
             yield {"reasoning": delta.reasoning}
         content = delta.content
-        if content is not None:
-            in_tool, content = suppress_tool_call_content(full, in_tool, tc_start, content)
-            if content:
-                yield {"content": content}
-    if tool_module is not None and tools:
+        if content is None:
+            continue
+        in_tool, content = suppress_tool_call_content(full, in_tool, tc_start, content)
+        if not content:
+            continue
+        pending += content
+        if stops:
+            idx = _find_stop(pending, stops)
+            if idx != -1:
+                if idx:
+                    yield {"content": pending[:idx]}
+                pending = ""
+                stopped = True
+                _close(raw_iter)  # halt the underlying mlx generator promptly
+                break
+            if len(pending) > keep:
+                yield {"content": pending[: len(pending) - keep]}
+                pending = pending[len(pending) - keep:]
+        else:
+            yield {"content": pending}
+            pending = ""
+    if not stopped and pending:
+        yield {"content": pending}
+    if not stopped and tool_module is not None and tools:
         try:
             result = process_tool_calls(full, tool_module, tools)
         except Exception as exc:
@@ -86,6 +134,139 @@ def _parse_events(raw_iter, enable_thinking, tool_module, tools) -> Iterator[dic
             result = None
         if result and result.get("calls"):
             yield {"tool_calls": result["calls"]}
+
+
+def _close(it) -> None:
+    closer = getattr(it, "close", None)
+    if callable(closer):
+        try:
+            closer()
+        except Exception:
+            pass
+
+
+def _build_sampler(temperature, top_p, top_k, min_p):
+    from mlx_lm.sample_utils import make_sampler
+
+    return make_sampler(
+        temp=float(temperature),
+        top_p=float(top_p or 0.0),
+        min_p=float(min_p or 0.0),
+        top_k=int(top_k or 0),
+    )
+
+
+def _build_logits_processors(
+    logit_bias, repetition_penalty, presence_penalty, frequency_penalty, structured
+):
+    """mlx-lm logit-bias/penalty processors + an optional structured-output processor."""
+    procs: list = []
+    if any(
+        v is not None
+        for v in (logit_bias, repetition_penalty, presence_penalty, frequency_penalty)
+    ):
+        from mlx_lm.sample_utils import make_logits_processors
+
+        procs = list(
+            make_logits_processors(
+                logit_bias=logit_bias,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
+            )
+        )
+    if structured is not None:
+        procs.append(structured)
+    return procs or None
+
+
+def _build_structured(hf_tokenizer, response_format):
+    """An llguidance logits processor enforcing OpenAI ``response_format``, or None.
+
+    Reuses mlx-vlm's ``build_json_schema_logits_processor`` (backed by the already
+    installed ``llguidance``) so the model can only sample schema-valid JSON tokens —
+    a *guarantee*, not best-effort prompting. Degrades to None (unconstrained) on any
+    failure so a bad schema never 500s the request.
+    """
+    if not isinstance(response_format, dict):
+        return None
+    rtype = response_format.get("type")
+    if rtype not in ("json_object", "json_schema"):
+        return None  # "text" / unknown -> unconstrained
+    try:
+        from mlx_vlm.structured import build_json_schema_logits_processor
+    except Exception as exc:
+        logger.warning("response_format needs mlx-vlm+llguidance (%s); ignoring", exc)
+        return None
+    if rtype == "json_object":
+        schema: object = {"type": "object"}
+    else:
+        js = response_format.get("json_schema") or {}
+        schema = js.get("schema") or js
+    try:
+        return build_json_schema_logits_processor(hf_tokenizer, schema)
+    except Exception as exc:
+        logger.warning("could not compile JSON grammar (%s); ignoring response_format", exc)
+        return None
+
+
+def _apply_seed(seed) -> None:
+    if seed is None:
+        return
+    try:
+        import mlx.core as mx
+
+        mx.random.seed(int(seed))
+    except Exception as exc:
+        logger.warning("could not set seed (%s)", exc)
+
+
+def _capture_usage(chunk, usage: dict) -> None:
+    """Record cumulative token counts off a stream_generate result object.
+
+    Both mlx-lm's GenerationResponse and mlx-vlm's GenerationResult expose
+    ``.prompt_tokens`` and ``.generation_tokens`` (cumulative); the last object wins.
+    """
+    p = getattr(chunk, "prompt_tokens", None)
+    g = getattr(chunk, "generation_tokens", None)
+    if p is not None:
+        usage["prompt_tokens"] = int(p)
+    if g is not None:
+        usage["completion_tokens"] = int(g)
+
+
+def _usage_event(usage: dict):
+    """An OpenAI usage object wrapped as a typed event, or None if no counts captured."""
+    if not usage:
+        return None
+    p = int(usage.get("prompt_tokens", 0))
+    c = int(usage.get("completion_tokens", 0))
+    return {"usage": {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}}
+
+
+def _raw_with_kv_fallback(make_gen, gen_kw, usage) -> Iterator[str]:
+    """Iterate a stream_generate, yielding ``.text`` deltas and recording token counts.
+
+    If KV-cache quantization isn't supported for this model — e.g. Gemma's
+    sliding-window ``RotatingKVCache`` raises ``NotImplementedError`` — retry once
+    without ``kv_bits`` (only safe before any token was produced).
+    """
+    produced = False
+    try:
+        for chunk in make_gen(gen_kw):
+            produced = True
+            _capture_usage(chunk, usage)
+            t = getattr(chunk, "text", None)
+            yield t if t is not None else str(chunk)
+    except NotImplementedError as exc:
+        if produced or not gen_kw.get("kv_bits"):
+            raise
+        logger.warning("kv_bits unsupported for this model (%s); retrying unquantized", exc)
+        kw = {k: v for k, v in gen_kw.items() if k != "kv_bits"}
+        for chunk in make_gen(kw):
+            _capture_usage(chunk, usage)
+            t = getattr(chunk, "text", None)
+            yield t if t is not None else str(chunk)
 
 
 class MlxLmModel:
@@ -134,6 +315,16 @@ class MlxLmModel:
         images=None,
         tools=None,
         enable_thinking=False,
+        top_k=None,
+        min_p=None,
+        seed=None,
+        repetition_penalty=None,
+        presence_penalty=None,
+        frequency_penalty=None,
+        logit_bias=None,
+        stop=None,
+        response_format=None,
+        kv_bits=0,
     ) -> Iterator[dict]:
         if images:
             raise ValueError(
@@ -141,20 +332,37 @@ class MlxLmModel:
             )
 
         from mlx_lm import stream_generate
-        from mlx_lm.sample_utils import make_sampler
 
         prompt = self._build_prompt(messages, tools, enable_thinking)
-        sampler = make_sampler(temp=temperature, top_p=top_p)
         tool_module = self._tool_module() if tools else None
+        hf_tok = getattr(self.tokenizer, "_tokenizer", self.tokenizer)
+        structured = _build_structured(hf_tok, response_format)
+        processors = _build_logits_processors(
+            logit_bias, repetition_penalty, presence_penalty, frequency_penalty, structured
+        )
+        _apply_seed(seed)
+        gen_kw = {
+            "max_tokens": max_tokens,
+            "sampler": _build_sampler(temperature, top_p, top_k, min_p),
+        }
+        if processors:
+            gen_kw["logits_processors"] = processors
+        if kv_bits:
+            gen_kw["kv_bits"] = int(kv_bits)
+
+        usage: dict = {}
 
         def raw():
-            for response in stream_generate(
-                self.model, self.tokenizer, prompt, max_tokens=max_tokens, sampler=sampler
-            ):
-                t = getattr(response, "text", None)
-                yield t if t is not None else str(response)
+            yield from _raw_with_kv_fallback(
+                lambda kw: stream_generate(self.model, self.tokenizer, prompt, **kw),
+                gen_kw,
+                usage,
+            )
 
-        yield from _parse_events(raw(), enable_thinking, tool_module, tools)
+        yield from _parse_events(raw(), enable_thinking, tool_module, tools, stop)
+        ev = _usage_event(usage)
+        if ev:
+            yield ev
 
     def close(self) -> None:
         self.model = None
@@ -235,27 +443,56 @@ class MlxVlmModel:
         images=None,
         tools=None,
         enable_thinking=False,
+        top_k=None,
+        min_p=None,
+        seed=None,
+        repetition_penalty=None,
+        presence_penalty=None,
+        frequency_penalty=None,
+        logit_bias=None,
+        stop=None,
+        response_format=None,
+        kv_bits=0,
     ) -> Iterator[dict]:
         from mlx_vlm import stream_generate
 
         image_refs = self._resolve_images(images)
         prompt = self._build_prompt(messages, len(image_refs), tools, enable_thinking)
         tool_module = self._tool_module() if tools else None
+        hf_tok = getattr(self.processor, "tokenizer", self.processor)
+        structured = _build_structured(hf_tok, response_format)
+        processors = _build_logits_processors(
+            logit_bias, repetition_penalty, presence_penalty, frequency_penalty, structured
+        )
+        _apply_seed(seed)
+        gen_kw = {
+            "image": image_refs or None,
+            "max_tokens": max_tokens,
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+        }
+        if top_k:
+            gen_kw["top_k"] = int(top_k)
+        if min_p:
+            gen_kw["min_p"] = float(min_p)
+        if processors:
+            gen_kw["logits_processors"] = processors
+        if kv_bits:
+            gen_kw["kv_bits"] = int(kv_bits)
+
+        usage: dict = {}
 
         def raw():
-            for chunk in stream_generate(
-                self.model,
-                self.processor,
-                prompt,
-                image=image_refs or None,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-            ):
-                t = getattr(chunk, "text", None)
-                yield t if t is not None else str(chunk)
+            yield from _raw_with_kv_fallback(
+                lambda kw: stream_generate(self.model, self.processor, prompt, **kw),
+                gen_kw,
+                usage,
+            )
 
-        yield from _parse_events(raw(), enable_thinking, tool_module, tools)
+        yield from _parse_events(raw(), enable_thinking, tool_module, tools, stop)
+        ev = _usage_event(usage)
+        if ev:
+            yield ev
 
     def close(self) -> None:
         self.model = None

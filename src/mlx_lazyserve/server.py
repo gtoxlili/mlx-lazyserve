@@ -75,11 +75,35 @@ def _resolve_model(body: dict) -> str:
 
 
 def _params(body: dict) -> dict:
-    return {
-        "max_tokens": int(body.get("max_tokens") or settings.default_max_tokens),
+    """OpenAI sampling/control fields → engine stream kwargs (optional ones only when sent)."""
+    p: dict = {
+        "max_tokens": int(
+            body.get("max_tokens")
+            or body.get("max_completion_tokens")
+            or settings.default_max_tokens
+        ),
         "temperature": float(body.get("temperature", 0.7)),
         "top_p": float(body.get("top_p", 0.95)),
+        "kv_bits": int(body.get("kv_bits", settings.default_kv_bits) or 0),
     }
+    if body.get("top_k") is not None:
+        p["top_k"] = int(body["top_k"])
+    if body.get("min_p") is not None:
+        p["min_p"] = float(body["min_p"])
+    if body.get("seed") is not None:
+        p["seed"] = int(body["seed"])
+    if body.get("repetition_penalty") is not None:
+        p["repetition_penalty"] = float(body["repetition_penalty"])
+    if body.get("presence_penalty") is not None:
+        p["presence_penalty"] = float(body["presence_penalty"])
+    if body.get("frequency_penalty") is not None:
+        p["frequency_penalty"] = float(body["frequency_penalty"])
+    if isinstance(body.get("logit_bias"), dict) and body["logit_bias"]:
+        p["logit_bias"] = {int(k): float(v) for k, v in body["logit_bias"].items()}
+    stop = body.get("stop")
+    if stop:
+        p["stop"] = [stop] if isinstance(stop, str) else [s for s in stop if s]
+    return p
 
 
 def _resolve_tools(body: dict):
@@ -214,11 +238,14 @@ async def _watch_disconnect(request: Request, abort: threading.Event) -> None:
         pass
 
 
-async def _stream_completion(cid, created, model, messages, params, abort):
+async def _stream_completion(cid, created, model, messages, params, abort, include_usage=False):
     """SSE generator. Runs the blocking model stream in a worker thread and bridges it
     through a queue. On client disconnect Starlette closes this generator, the `finally`
     sets `abort`, and the worker stops + releases the model lock — so an aborted caller
-    never leaves a generation hogging the GPU and the single model slot."""
+    never leaves a generation hogging the GPU and the single model slot.
+
+    With ``include_usage`` (OpenAI ``stream_options.include_usage``) a final usage-only
+    chunk (``choices: []`` + ``usage``) is emitted before ``[DONE]``."""
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
@@ -233,6 +260,7 @@ async def _stream_completion(cid, created, model, messages, params, abort):
 
     producer = asyncio.create_task(asyncio.to_thread(produce))
     finish = "stop"
+    usage = None
     try:
         yield _chunk(cid, created, model, {"role": "assistant"})
         while True:
@@ -244,7 +272,9 @@ async def _stream_completion(cid, created, model, messages, params, abort):
                 yield _chunk(cid, created, model, {"content": f"\n[error: {value}]"}, finish="stop")
                 yield "data: [DONE]\n\n"
                 return
-            if "reasoning" in value:
+            if "usage" in value:
+                usage = value["usage"]
+            elif "reasoning" in value:
                 yield _chunk(cid, created, model, {"reasoning_content": value["reasoning"]})
             elif "tool_calls" in value:
                 finish = "tool_calls"
@@ -252,6 +282,16 @@ async def _stream_completion(cid, created, model, messages, params, abort):
             elif value.get("content"):
                 yield _chunk(cid, created, model, {"content": value["content"]})
         yield _chunk(cid, created, model, {}, finish=finish)
+        if include_usage and usage:
+            usage_chunk = {
+                "id": cid,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [],
+                "usage": usage,
+            }
+            yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
     finally:
         abort.set()
@@ -269,17 +309,27 @@ async def chat_completions(request: Request):
     body = await request.json()
     model = _resolve_model(body)
     messages, images = _split_multimodal(body.get("messages") or [])
+    tools = _resolve_tools(body)
+    rf = body.get("response_format")
+    structured = isinstance(rf, dict) and rf.get("type") in ("json_object", "json_schema")
+    if structured and tools:
+        raise HTTPException(
+            status_code=400, detail="response_format and tools cannot be used together"
+        )
     params = _params(body)
     params["images"] = images
-    params["tools"] = _resolve_tools(body)
-    params["enable_thinking"] = _enable_thinking(body)
+    params["tools"] = tools
+    # structured output emits JSON directly — incompatible with free-form <think> reasoning
+    params["enable_thinking"] = False if structured else _enable_thinking(body)
+    params["response_format"] = rf if structured else None
     cid = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     abort = threading.Event()
 
     if body.get("stream"):
+        include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
         return StreamingResponse(
-            _stream_completion(cid, created, model, messages, params, abort),
+            _stream_completion(cid, created, model, messages, params, abort, include_usage),
             media_type="text/event-stream",
         )
 
@@ -296,6 +346,10 @@ async def chat_completions(request: Request):
     content = "".join(e["content"] for e in events if "content" in e)
     reasoning = "".join(e["reasoning"] for e in events if "reasoning" in e)
     tool_calls = [tc for e in events if "tool_calls" in e for tc in e["tool_calls"]]
+    usage = next(
+        (e["usage"] for e in reversed(events) if "usage" in e),
+        {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    )
     message: dict = {"role": "assistant", "content": content or None}
     if reasoning:
         message["reasoning_content"] = reasoning
@@ -313,5 +367,5 @@ async def chat_completions(request: Request):
                 "finish_reason": "tool_calls" if tool_calls else "stop",
             }
         ],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": usage,
     }
