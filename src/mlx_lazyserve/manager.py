@@ -97,16 +97,33 @@ class ModelManager:
         self._model_name = name
         logger.info("loaded %s in %.1fs", name, time.monotonic() - t0)
 
-    def generate_stream(self, name: str, messages: list[dict], **params) -> Iterator[str]:
+    def generate_stream(
+        self,
+        name: str,
+        messages: list[dict],
+        *,
+        abort: threading.Event | None = None,
+        **params,
+    ) -> Iterator[str]:
         with self._lock:
             self._ensure_locked(name)
             model = self._model
             self._last_used = time.monotonic()
+            stream = model.stream(messages, **params)
             try:
-                for chunk in model.stream(messages, **params):
+                for chunk in stream:
+                    if abort is not None and abort.is_set():
+                        break  # caller went away — stop generating, release the lock
                     yield chunk
                     self._last_used = time.monotonic()
             finally:
+                # stop the underlying mlx generator promptly (frees the GPU on abort)
+                closer = getattr(stream, "close", None)
+                if callable(closer):
+                    try:
+                        closer()
+                    except Exception:
+                        pass
                 self._last_used = time.monotonic()
 
     def shutdown(self) -> None:

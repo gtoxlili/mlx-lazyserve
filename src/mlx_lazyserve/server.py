@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import subprocess
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from starlette.concurrency import run_in_threadpool
 
 from .config import load_settings
 from .manager import ModelManager
@@ -184,6 +185,59 @@ async def set_maintenance(request: Request) -> dict:
     return {"maintenance": manager.is_paused(), "loaded": manager.current_name()}
 
 
+async def _watch_disconnect(request: Request, abort: threading.Event) -> None:
+    """Set `abort` as soon as the client disconnects, so generation can stop early."""
+    try:
+        while not abort.is_set():
+            if await request.is_disconnected():
+                abort.set()
+                return
+            await asyncio.sleep(0.3)
+    except asyncio.CancelledError:
+        pass
+
+
+async def _stream_completion(cid, created, model, messages, params, abort):
+    """SSE generator. Runs the blocking model stream in a worker thread and bridges it
+    through a queue. On client disconnect Starlette closes this generator, the `finally`
+    sets `abort`, and the worker stops + releases the model lock — so an aborted caller
+    never leaves a generation hogging the GPU and the single model slot."""
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def produce():
+        try:
+            for text in manager.generate_stream(model, messages, abort=abort, **params):
+                loop.call_soon_threadsafe(queue.put_nowait, ("chunk", text))
+        except Exception as exc:  # surface load/inference errors into the stream
+            loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+
+    producer = asyncio.create_task(asyncio.to_thread(produce))
+    try:
+        yield _chunk(cid, created, model, {"role": "assistant"})
+        while True:
+            kind, value = await queue.get()
+            if kind == "done":
+                break
+            if kind == "error":
+                logging.error("generation failed: %s", value)
+                yield _chunk(cid, created, model, {"content": f"\n[error: {value}]"}, finish="stop")
+                yield "data: [DONE]\n\n"
+                return
+            if value:
+                yield _chunk(cid, created, model, {"content": value})
+        yield _chunk(cid, created, model, {}, finish="stop")
+        yield "data: [DONE]\n\n"
+    finally:
+        abort.set()
+        try:
+            await producer
+        except Exception:
+            pass
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     _require_auth(request)
@@ -196,29 +250,23 @@ async def chat_completions(request: Request):
     params["images"] = images
     cid = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
+    abort = threading.Event()
 
     if body.get("stream"):
+        return StreamingResponse(
+            _stream_completion(cid, created, model, messages, params, abort),
+            media_type="text/event-stream",
+        )
 
-        def sse():
-            yield _chunk(cid, created, model, {"role": "assistant"})
-            try:
-                for text in manager.generate_stream(model, messages, **params):
-                    if text:
-                        yield _chunk(cid, created, model, {"content": text})
-            except Exception as exc:  # surface load/inference errors into the stream
-                logging.exception("generation failed")
-                yield _chunk(cid, created, model, {"content": f"\n[error: {exc}]"}, finish="stop")
-                yield "data: [DONE]\n\n"
-                return
-            yield _chunk(cid, created, model, {}, finish="stop")
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(sse(), media_type="text/event-stream")
-
-    def collect() -> str:
-        return "".join(manager.generate_stream(model, messages, **params))
-
-    text = await run_in_threadpool(collect)
+    # Non-streaming: generate in a worker thread; a watcher aborts it if the client leaves.
+    watcher = asyncio.create_task(_watch_disconnect(request, abort))
+    try:
+        text = await asyncio.to_thread(
+            lambda: "".join(manager.generate_stream(model, messages, abort=abort, **params))
+        )
+    finally:
+        abort.set()
+        watcher.cancel()
     return {
         "id": cid,
         "object": "chat.completion",
