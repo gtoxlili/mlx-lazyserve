@@ -17,3 +17,6 @@ logs/*.log
 
 # Real/production LaunchAgent plists (carry Tailscale IP + API keys)
 *.local.plist
+
+# Real service env (API key) consumed by deploy/install.sh
+deploy/service.env

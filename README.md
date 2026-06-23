@@ -85,33 +85,27 @@ Point any OpenAI SDK at `http://<tailscale-ip>:41434/v1` and set the model to on
 
 ## Run as a service (24/7)
 
-The LaunchAgent runs `uv run --no-sync` — it uses the **already-synced** venv (no
-re-resolve/lock on each restart), so sync the env once at deploy time:
+This repo is the **source**; the running service is a separate **runtime entity** that
+lives OUTSIDE `~/Downloads`. That matters: `~/Downloads` (and `~/Documents`, `~/Desktop`)
+are macOS **TCC-protected** folders, and a launchd agent running the venv's python from
+there is silently denied (`Operation not permitted`, no prompt). [`deploy/install.sh`](deploy/install.sh)
+syncs the source into `~/.mlx-lazyserve/`, builds a venv there, and installs a LaunchAgent
+that runs that runtime venv's python **directly** — no `uv` wrapper, no TCC denial, no
+authorization popup, and clean signals (no orphaned process holding the port on restart).
 
 ```bash
-uv sync --extra vision     # one-time / after dependency changes
+cp deploy/service.env.example deploy/service.env   # fill in API key, host, port…
+bash deploy/install.sh                             # build runtime + (re)install the service
+tail -f ~/.mlx-lazyserve/logs/stderr.log           # watch it
 ```
 
-> Why `uv run` and not `.venv/bin/mlx-lazyserve` directly? The project lives in
-> `~/Downloads`, a macOS **TCC-protected** folder — a launchd agent running the venv's
-> python there is denied (`Operation not permitted`, with no prompt). `uv` (in
-> `/opt/homebrew`) holds the granted access and its child inherits it. Moving the project
-> out of `~/Downloads` lets you run the entry point directly.
+Re-run `bash deploy/install.sh` after code changes to redeploy (idempotent). `service.env`
+is gitignored so your API key never gets committed; `MLX_LAZYSERVE_HOME` overrides the
+runtime path. The wired-memory limit needs the one-time sudoers rule (below).
 
-`launchd/dev.influo.mlx-lazyserve.plist` is a committed **template** (binds `0.0.0.0`, no
-auth). For a real deployment, keep a gitignored `*.local.plist` with your Tailscale IP +
-an API key, and install that:
-
-```bash
-cp launchd/dev.influo.mlx-lazyserve.local.plist ~/Library/LaunchAgents/dev.influo.mlx-lazyserve.plist
-launchctl load ~/Library/LaunchAgents/dev.influo.mlx-lazyserve.plist
-launchctl list | grep mlx          # confirm it's running
-```
-
-`*.local.plist` is gitignored, so your real IP/keys never get committed. A LaunchAgent runs
-inside your login session, so on a headless mini enable **auto-login** (System Settings →
-Users & Groups) — otherwise it won't start after a reboot with nobody logged in. macOS may
-prompt once to authorize `uv`/Python — click Allow. Logs go to `logs/`.
+A LaunchAgent runs inside your login session, so on a headless mini enable **auto-login**
+(System Settings → Users & Groups) — otherwise it won't start after a reboot with nobody
+logged in.
 
 With `MLX_LAZYSERVE_API_KEYS` set, send `Authorization: Bearer <key>` on `/v1/*` and
 `/admin/*` (`/health` stays open).
