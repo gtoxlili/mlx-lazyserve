@@ -26,3 +26,10 @@ engine = "auto"
 repo = "TheCluster/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-MLX-mxfp4"
 engine = "auto"
 default = true
+
+# --- OCR (vision): Baidu Unlimited-OCR, small + fast for high-frequency calls ---
+[models."unlimited-ocr"]
+# Baidu Unlimited-OCR (3B) mapped to the DeepSeek-OCR arch; community MLX mxfp4 (~1.8 GB).
+# Image-Text-to-Text — needs the vision engine. mxfp4 = best quality at 4-bit + proven in this stack.
+repo = "sahilchachra/unlimited-ocr-mxfp4-mlx"
+engine = "mlx_vlm"

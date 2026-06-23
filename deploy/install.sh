@@ -75,10 +75,19 @@ PLIST
 
 echo "==> (re)bootstrap LaunchAgent"
 DOMAIN="gui/$(id -u)"
+PORT="${MLX_LAZYSERVE_PORT:-41434}"
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
-# bootout is ASYNCHRONOUS: the old instance may still be tearing down. Bootstrapping while
-# it's mid-teardown fails with "Bootstrap failed: 5: Input/output error" and leaves the job
-# UNLOADED (service down). Retry until the fresh instance takes.
+# bootout is ASYNCHRONOUS and the old instance can be SLOW to exit — uvicorn drains open
+# connections and unloading a ~19 GB model takes seconds. Bootstrapping before the old process
+# frees the port fails with "Bootstrap failed: 5: Input/output error" and leaves the job
+# UNLOADED. So wait for the port to actually free (force-killing a straggler that overstays
+# ~15s), THEN bootstrap (retrying for any residual settling).
+for i in $(seq 1 80); do
+    pid="$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1)"
+    [ -z "$pid" ] && break
+    [ "$i" -ge 30 ] && kill -9 "$pid" 2>/dev/null || true
+    sleep 0.5
+done
 bootstrapped=0
 for _ in $(seq 1 20); do
     if launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null; then bootstrapped=1; break; fi
