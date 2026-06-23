@@ -13,6 +13,7 @@ This server keeps Ollama's best ergonomic — **lazy load + idle unload** — so
 ## Features
 
 - OpenAI-compatible `POST /v1/chat/completions` (streaming + non-streaming), `GET /v1/models`, `GET /health`
+- **Tool calling** (`tools`/`tool_choice` → `tool_calls` + `finish_reason:"tool_calls"`) and **reasoning** (`enable_thinking` → a separate `reasoning_content`), both streaming + non-streaming; parsing reuses each model's mlx-lm/mlx-vlm `tool_parsers`
 - Lazy model load on first use; single-slot (one model resident at a time — fits 24 GB)
 - Idle unload after `IDLE_TIMEOUT` to release unified memory
 - Auto engine: tries `mlx-lm`, falls back to `mlx-vlm` for vision-language architectures
@@ -67,6 +68,7 @@ This is already set in the LaunchAgent plist, so the running service downloads m
 | `MLX_LAZYSERVE_PORT` | `41434` | port (high, avoids dev-server clashes) |
 | `MLX_LAZYSERVE_IDLE_TIMEOUT` | `600` | seconds idle before unloading (`0` = never) |
 | `MLX_LAZYSERVE_MAX_TOKENS` | `8192` | default max output tokens (headroom for reasoning models; per-request `max_tokens` overrides) |
+| `MLX_LAZYSERVE_ENABLE_THINKING` | `false` | default thinking/reasoning state; per-request `enable_thinking` overrides |
 | `MLX_LAZYSERVE_WIRED_LIMIT_MB` | `0` | if > 0, set Metal wired limit on start, reset on stop |
 | `MLX_LAZYSERVE_API_KEYS` | *(empty)* | comma-separated bearer tokens; empty = no auth |
 | `MLX_LAZYSERVE_MODELS` | `./models.toml` | path to the model registry |
@@ -82,6 +84,39 @@ curl http://<tailscale-ip>:41434/v1/chat/completions \
 ```
 
 Point any OpenAI SDK at `http://<tailscale-ip>:41434/v1` and set the model to one of the names above.
+
+### Tool calling
+
+Pass OpenAI-style `tools` (and optionally `tool_choice`). When the model calls a tool the
+reply carries `tool_calls` with `finish_reason: "tool_calls"` (and `content: null`):
+
+```bash
+curl http://<tailscale-ip>:41434/v1/chat/completions \
+  -H 'Authorization: Bearer <key>' -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.5-9b","messages":[{"role":"user","content":"weather in Boston?"}],
+       "tools":[{"type":"function","function":{"name":"get_current_weather",
+         "description":"Get the current weather in a location",
+         "parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}}]}'
+# -> choices[0].message.tool_calls[0].function = {"name":"get_current_weather","arguments":"{\"location\":\"Boston, MA\"}"}
+```
+
+`tool_choice:"none"` disables calling (the tools still inform the model). Parsing reuses each
+model's native `tool_parsers`, so the model's own wire format (Qwen XML, Gemma, …) is
+normalized to OpenAI `tool_calls` — streamed as `delta.tool_calls`, or whole when non-streaming.
+
+### Thinking / reasoning
+
+Thinking is **off by default** (clean answers). Enable it per request with `enable_thinking`
+(or `chat_template_kwargs.enable_thinking`); the thinking text returns in a separate
+`reasoning_content` field (streamed as `delta.reasoning_content`), never mixed into `content`:
+
+```bash
+curl http://<tailscale-ip>:41434/v1/chat/completions \
+  -H 'Authorization: Bearer <key>' -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.5-9b","messages":[{"role":"user","content":"is 91 prime?"}],"enable_thinking":true}'
+```
+
+Flip the server-wide default with `MLX_LAZYSERVE_ENABLE_THINKING=true`.
 
 ## Run as a service (24/7)
 
@@ -169,7 +204,7 @@ While paused, `/v1/chat/completions` returns `503` with an OpenAI-style error
 
 ## Status / caveats
 
-- ✅ Smoke-tested with `qwen3.5-9b`: loads via mlx-lm (~2 s from cache), streaming + non-streaming chat both work, and idle-unload releases memory. The two mains (SuperGemma4, Qwen3.6 Heretic) aren't load-tested yet.
+- ✅ Smoke-tested with `qwen3.5-9b`: loads via mlx-lm (~2 s from cache); streaming + non-streaming chat, **tool calling**, and **thinking → `reasoning_content`** all verified, plus abort-on-disconnect and idle-unload. The two mains (SuperGemma4, Qwen3.6 Heretic) aren't load-tested yet.
 - Gemma 4 is new; use a recent `mlx-vlm` (≥ 0.4.3) or you may hit `Model type gemma4 not supported`.
 - Image input is wired (`image_url` content parts → mlx-vlm) but not yet exercised with a real image.
 - `usage` token counts are returned as 0 (not computed yet).

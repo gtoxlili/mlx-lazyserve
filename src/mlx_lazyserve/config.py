@@ -24,6 +24,7 @@ class Settings:
     port: int
     idle_timeout: float  # seconds of inactivity before unloading (0 = never)
     default_max_tokens: int
+    default_enable_thinking: bool  # default for the chat-template thinking switch
     wired_limit_mb: int  # if > 0, raise iogpu.wired_limit_mb on start, reset to 0 on stop
     api_keys: tuple[str, ...]  # bearer tokens; empty tuple = no auth (rely on Tailscale)
     models: dict[str, ModelSpec]
@@ -74,6 +75,10 @@ def load_settings() -> Settings:
         port=int(os.environ.get("MLX_LAZYSERVE_PORT", "41434")),
         idle_timeout=float(os.environ.get("MLX_LAZYSERVE_IDLE_TIMEOUT", "600")),
         default_max_tokens=int(os.environ.get("MLX_LAZYSERVE_MAX_TOKENS", "8192")),
+        default_enable_thinking=os.environ.get("MLX_LAZYSERVE_ENABLE_THINKING", "false")
+        .strip()
+        .lower()
+        in ("1", "true", "yes", "on"),
         wired_limit_mb=int(os.environ.get("MLX_LAZYSERVE_WIRED_LIMIT_MB", "0")),
         api_keys=api_keys,
         models=models,

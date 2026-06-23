@@ -82,6 +82,23 @@ def _params(body: dict) -> dict:
     }
 
 
+def _resolve_tools(body: dict):
+    """OpenAI tools/tool_choice -> the tools list fed to the chat template (or None)."""
+    if body.get("tool_choice") == "none":
+        return None
+    return body.get("tools") or None
+
+
+def _enable_thinking(body: dict) -> bool:
+    """Per-request thinking switch: body.enable_thinking or chat_template_kwargs, else default."""
+    if "enable_thinking" in body:
+        return bool(body["enable_thinking"])
+    cck = body.get("chat_template_kwargs")
+    if isinstance(cck, dict) and "enable_thinking" in cck:
+        return bool(cck["enable_thinking"])
+    return settings.default_enable_thinking
+
+
 def _split_multimodal(messages: list[dict]) -> tuple[list[dict], list[str]]:
     """Flatten OpenAI message content into text + a list of image references.
 
@@ -207,14 +224,15 @@ async def _stream_completion(cid, created, model, messages, params, abort):
 
     def produce():
         try:
-            for text in manager.generate_stream(model, messages, abort=abort, **params):
-                loop.call_soon_threadsafe(queue.put_nowait, ("chunk", text))
+            for event in manager.generate_stream(model, messages, abort=abort, **params):
+                loop.call_soon_threadsafe(queue.put_nowait, ("event", event))
         except Exception as exc:  # surface load/inference errors into the stream
             loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
 
     producer = asyncio.create_task(asyncio.to_thread(produce))
+    finish = "stop"
     try:
         yield _chunk(cid, created, model, {"role": "assistant"})
         while True:
@@ -226,9 +244,14 @@ async def _stream_completion(cid, created, model, messages, params, abort):
                 yield _chunk(cid, created, model, {"content": f"\n[error: {value}]"}, finish="stop")
                 yield "data: [DONE]\n\n"
                 return
-            if value:
-                yield _chunk(cid, created, model, {"content": value})
-        yield _chunk(cid, created, model, {}, finish="stop")
+            if "reasoning" in value:
+                yield _chunk(cid, created, model, {"reasoning_content": value["reasoning"]})
+            elif "tool_calls" in value:
+                finish = "tool_calls"
+                yield _chunk(cid, created, model, {"tool_calls": value["tool_calls"]})
+            elif value.get("content"):
+                yield _chunk(cid, created, model, {"content": value["content"]})
+        yield _chunk(cid, created, model, {}, finish=finish)
         yield "data: [DONE]\n\n"
     finally:
         abort.set()
@@ -248,6 +271,8 @@ async def chat_completions(request: Request):
     messages, images = _split_multimodal(body.get("messages") or [])
     params = _params(body)
     params["images"] = images
+    params["tools"] = _resolve_tools(body)
+    params["enable_thinking"] = _enable_thinking(body)
     cid = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     abort = threading.Event()
@@ -261,12 +286,21 @@ async def chat_completions(request: Request):
     # Non-streaming: generate in a worker thread; a watcher aborts it if the client leaves.
     watcher = asyncio.create_task(_watch_disconnect(request, abort))
     try:
-        text = await asyncio.to_thread(
-            lambda: "".join(manager.generate_stream(model, messages, abort=abort, **params))
+        events = await asyncio.to_thread(
+            lambda: list(manager.generate_stream(model, messages, abort=abort, **params))
         )
     finally:
         abort.set()
         watcher.cancel()
+
+    content = "".join(e["content"] for e in events if "content" in e)
+    reasoning = "".join(e["reasoning"] for e in events if "reasoning" in e)
+    tool_calls = [tc for e in events if "tool_calls" in e for tc in e["tool_calls"]]
+    message: dict = {"role": "assistant", "content": content or None}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    if tool_calls:
+        message["tool_calls"] = tool_calls
     return {
         "id": cid,
         "object": "chat.completion",
@@ -275,8 +309,8 @@ async def chat_completions(request: Request):
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
+                "message": message,
+                "finish_reason": "tool_calls" if tool_calls else "stop",
             }
         ],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},

@@ -104,7 +104,7 @@ class ModelManager:
         *,
         abort: threading.Event | None = None,
         **params,
-    ) -> Iterator[str]:
+    ) -> Iterator[dict]:
         with self._lock:
             self._ensure_locked(name)
             model = self._model
