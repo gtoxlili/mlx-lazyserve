@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -23,10 +24,35 @@ settings = load_settings()
 manager = ModelManager(settings)
 
 
+def _set_wired_limit(mb: int) -> None:
+    """Best-effort: set the Metal GPU wired-memory limit via a NOPASSWD sudo rule.
+
+    Needs a scoped /etc/sudoers.d rule (see README). Without it this logs a
+    warning and the service keeps running on the default ~75% cap.
+    """
+    log = logging.getLogger("mlx_lazyserve")
+    try:
+        subprocess.run(
+            ["sudo", "-n", "/usr/sbin/sysctl", f"iogpu.wired_limit_mb={mb}"],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+        log.info("set iogpu.wired_limit_mb=%d", mb)
+    except Exception as exc:
+        log.warning("could not set iogpu.wired_limit_mb=%d (%s)", mb, exc)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    yield
-    manager.shutdown()
+    if settings.wired_limit_mb > 0:
+        _set_wired_limit(settings.wired_limit_mb)
+    try:
+        yield
+    finally:
+        manager.shutdown()
+        if settings.wired_limit_mb > 0:
+            _set_wired_limit(0)  # restore the default cap on graceful shutdown
 
 
 app = FastAPI(title="mlx-lazyserve", version="0.1.0", lifespan=lifespan)

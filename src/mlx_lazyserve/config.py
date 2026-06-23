@@ -24,6 +24,7 @@ class Settings:
     port: int
     idle_timeout: float  # seconds of inactivity before unloading (0 = never)
     default_max_tokens: int
+    wired_limit_mb: int  # if > 0, raise iogpu.wired_limit_mb on start, reset to 0 on stop
     api_keys: tuple[str, ...]  # bearer tokens; empty tuple = no auth (rely on Tailscale)
     models: dict[str, ModelSpec]
     default_model: str | None
@@ -72,6 +73,7 @@ def load_settings() -> Settings:
         port=int(os.environ.get("MLX_LAZYSERVE_PORT", "11435")),
         idle_timeout=float(os.environ.get("MLX_LAZYSERVE_IDLE_TIMEOUT", "600")),
         default_max_tokens=int(os.environ.get("MLX_LAZYSERVE_MAX_TOKENS", "2048")),
+        wired_limit_mb=int(os.environ.get("MLX_LAZYSERVE_WIRED_LIMIT_MB", "0")),
         api_keys=api_keys,
         models=models,
         default_model=default_model,

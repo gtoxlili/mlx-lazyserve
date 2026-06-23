@@ -12,7 +12,6 @@
 # Text-only build (best benchmarks), tuned for Apple Silicon.
 repo = "Jiunsong/supergemma4-26b-uncensored-mlx-4bit-v2"
 engine = "auto"
-default = true
 
 # --- Main heavy hitter: tight on 24 GB; raise iogpu.wired_limit_mb (~22000) + modest context ---
 [models."qwen3.6-35b-a3b"]
@@ -26,3 +25,4 @@ engine = "auto"
 # HauhauCS Aggressive uncensored, community MLX conversion (mxfp4).
 repo = "TheCluster/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-MLX-mxfp4"
 engine = "auto"
+default = true

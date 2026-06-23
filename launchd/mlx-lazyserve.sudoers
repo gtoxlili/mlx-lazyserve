@@ -1,0 +1,9 @@
+# mlx-lazyserve: let the service (running as your user) raise/reset the Metal GPU
+# wired-memory limit without a password. Scoped to ONLY the iogpu.wired_limit_mb sysctl.
+#
+# Install (one-time):
+#   sudo install -m 0440 -o root -g wheel launchd/mlx-lazyserve.sudoers /etc/sudoers.d/mlx-lazyserve
+#   sudo visudo -c        # validate the whole sudoers config
+#
+# Replace "influo" if your username differs (check with: whoami).
+influo ALL=(root) NOPASSWD: /usr/sbin/sysctl iogpu.wired_limit_mb=*

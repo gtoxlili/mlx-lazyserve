@@ -26,6 +26,11 @@
         <string>11435</string>
         <key>MLX_LAZYSERVE_IDLE_TIMEOUT</key>
         <string>600</string>
+        <!-- Raise the Metal GPU wired-memory limit on start (reset to 0 on stop) so the
+             ~18.7 GB Qwen3.6-A3B fits past the measured ~17.8 GB default cap.
+             Needs the NOPASSWD sudoers rule (launchd/mlx-lazyserve.sudoers). -->
+        <key>MLX_LAZYSERVE_WIRED_LIMIT_MB</key>
+        <string>22000</string>
         <!-- These repos are xet-backed; xet transfer is slow from CN (~0.5 MB/s).
              Disabling xet uses the classic HF CDN path (~14 MB/s) with auto-resume. -->
         <key>HF_HUB_DISABLE_XET</key>

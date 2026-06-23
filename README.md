@@ -88,15 +88,25 @@ launchctl load ~/Library/LaunchAgents/dev.influo.mlx-lazyserve.plist
 
 A LaunchAgent runs inside your login session, so on a headless mini enable **auto-login** (System Settings → Users & Groups) — otherwise it won't start after a reboot with nobody logged in. Logs go to `logs/`.
 
-## Big models on 24 GB
+## Big models on 24 GB — Metal wired-memory limit
 
-For the 26B/MoE model (~15 GB) leave headroom, or raise the Metal wired limit on this dedicated box:
+macOS caps the GPU at ~75% of unified memory — measured **17.76 GB** on this M4 Pro
+(`mx.device_info()["max_recommended_working_set_size"]`). The Qwen3.6-A3B build is
+18.7 GB, so it needs the cap raised.
+
+The service handles this automatically: set `MLX_LAZYSERVE_WIRED_LIMIT_MB` (the plist
+uses `22000` ≈ 21.5 GB) and it runs `sysctl iogpu.wired_limit_mb=<n>` on **startup** and
+resets it to `0` on **graceful shutdown**. That needs a one-time, passwordless sudo rule
+scoped to *only* that sysctl (no password is stored anywhere):
 
 ```bash
-sudo sysctl iogpu.wired_limit_mb=22000   # not persistent across reboots
+sudo install -m 0440 -o root -g wheel launchd/mlx-lazyserve.sudoers /etc/sudoers.d/mlx-lazyserve
+sudo visudo -c    # validate
 ```
 
-Keep `max_tokens` / context modest to bound KV-cache growth.
+Without the rule the service still runs (it just logs a warning and stays on the default
+cap). Manual one-off: `sudo sysctl iogpu.wired_limit_mb=22000` (resets on reboot). Keep
+`max_tokens` / context modest to bound KV-cache growth.
 
 ## Status / caveats
 
