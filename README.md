@@ -85,6 +85,13 @@ Point any OpenAI SDK at `http://<tailscale-ip>:41434/v1` and set the model to on
 
 ## Run as a service (24/7)
 
+The LaunchAgent runs `uv run --no-sync` — it uses the **already-synced** venv (no
+re-resolve/lock on each restart), so sync the env once at deploy time:
+
+```bash
+uv sync --extra vision     # one-time / after dependency changes
+```
+
 `launchd/dev.influo.mlx-lazyserve.plist` is a committed **template** (binds `0.0.0.0`, no
 auth). For a real deployment, keep a gitignored `*.local.plist` with your Tailscale IP +
 an API key, and install that:
@@ -97,7 +104,8 @@ launchctl list | grep mlx          # confirm it's running
 
 `*.local.plist` is gitignored, so your real IP/keys never get committed. A LaunchAgent runs
 inside your login session, so on a headless mini enable **auto-login** (System Settings →
-Users & Groups) — otherwise it won't start after a reboot with nobody logged in. Logs go to `logs/`.
+Users & Groups) — otherwise it won't start after a reboot with nobody logged in. macOS may
+prompt once to authorize `uv`/Python — click Allow. Logs go to `logs/`.
 
 With `MLX_LAZYSERVE_API_KEYS` set, send `Authorization: Bearer <key>` on `/v1/*` and
 `/admin/*` (`/health` stays open).

@@ -9,8 +9,7 @@
     <array>
         <string>/opt/homebrew/bin/uv</string>
         <string>run</string>
-        <string>--extra</string>
-        <string>vision</string>
+        <string>--no-sync</string>
         <string>--directory</string>
         <string>~/mlx-lazyserve</string>
         <string>mlx-lazyserve</string>
