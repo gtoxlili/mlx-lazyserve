@@ -23,12 +23,13 @@ This server keeps Ollama's best ergonomic — **lazy load + idle unload** — so
 
 Configured in [`models.toml`](models.toml). Weights download lazily into `~/.cache/huggingface`.
 
-| name | repo | size (4-bit) | notes |
+| name | repo | size | role |
 |---|---|---|---|
-| `qwen3.5-9b` *(default)* | `TheCluster/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-MLX-mxfp4` | ~5 GB | exact HauhauCS model, community MLX conversion |
-| `gemma4-12b-qat` | `mlx-community/gemma-4-12B-it-qat-4bit` | ~7 GB | stock Google QAT (not abliterated) |
-| `gemma4-26b-uncensored` | `Jiunsong/supergemma4-26b-uncensored-mlx-4bit-v2` | ~15 GB | uncensored 26B-A4B MoE, different lineage than HauhauCS |
-| `qwen3.6-35b-a3b` | `TheCluster/Qwen3.6-35B-A3B-Heretic-MLX-mixed-3.9bit` | ~18.7 GB | uncensored 35B-A3B MoE; biggest pick that fits 24 GB (raise wired limit, see below) |
+| `gemma4-26b-uncensored` *(default)* | `Jiunsong/supergemma4-26b-uncensored-mlx-4bit-v2` | ~14.2 GB | **main** — uncensored SuperGemma4 26B-A4B MoE; comfortable on 24 GB |
+| `qwen3.6-35b-a3b` | `TheCluster/Qwen3.6-35B-A3B-Heretic-MLX-mixed-3.9bit` | ~18.7 GB | **main** — Heretic-abliterated 35B-A3B MoE; tight, raise wired limit (see below) |
+| `qwen3.5-9b` | `TheCluster/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-MLX-mxfp4` | ~5 GB | fallback — light & fast, always loads |
+
+All three are uncensored MLX builds. The two mains are MoE (~3–3.8B active) so they decode fast despite their size.
 
 > The exact HauhauCS Gemma is GGUF-only (no MLX), so the Gemma slots use the closest MLX equivalents.
 
@@ -46,6 +47,16 @@ uv run mlx-lazyserve
 ```
 
 The first request for a model is slow (download + load); subsequent ones are fast until it idles out.
+
+## Downloads from mainland China
+
+Most of these repos are **xet-backed**, and the default Xet transfer is slow from China (~0.5 MB/s). `hf-mirror.com` doesn't help for them — for xet repos it just 308-redirects to Hugging Face's xet CDN. The fix is to **disable xet** and use the classic CDN path (~14 MB/s, with auto-resume):
+
+```bash
+export HF_HUB_DISABLE_XET=1
+```
+
+This is already set in the LaunchAgent plist, so the running service downloads models this way too. If a drop interrupts a large download, just re-run — `hf download` resumes from the cache.
 
 ## Configuration (env vars)
 
@@ -89,9 +100,10 @@ Keep `max_tokens` / context modest to bound KV-cache growth.
 
 ## Status / caveats
 
-- ⚠️ Scaffold committed; **not yet smoke-tested against live weights**. The `mlx-vlm` text path targets mlx-vlm ≥ 0.4.3 and is verified on first run.
+- ✅ Smoke-tested with `qwen3.5-9b`: loads via mlx-lm (~2 s from cache), streaming + non-streaming chat both work, and idle-unload releases memory. The two mains (SuperGemma4, Qwen3.6 Heretic) aren't load-tested yet.
 - Gemma 4 is new; use a recent `mlx-vlm` (≥ 0.4.3) or you may hit `Model type gemma4 not supported`.
-- Vision/image input isn't wired into the API yet (text-only); the engine supports it and it's a small addition.
+- Image input is wired (`image_url` content parts → mlx-vlm) but not yet exercised with a real image.
+- `usage` token counts are returned as 0 (not computed yet).
 
 ## License
 

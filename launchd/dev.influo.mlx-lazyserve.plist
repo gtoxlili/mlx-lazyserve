@@ -9,6 +9,8 @@
     <array>
         <string>/opt/homebrew/bin/uv</string>
         <string>run</string>
+        <string>--extra</string>
+        <string>vision</string>
         <string>--directory</string>
         <string>~/mlx-lazyserve</string>
         <string>mlx-lazyserve</string>
@@ -24,6 +26,10 @@
         <string>11435</string>
         <key>MLX_LAZYSERVE_IDLE_TIMEOUT</key>
         <string>600</string>
+        <!-- These repos are xet-backed; xet transfer is slow from CN (~0.5 MB/s).
+             Disabling xet uses the classic HF CDN path (~14 MB/s) with auto-resume. -->
+        <key>HF_HUB_DISABLE_XET</key>
+        <string>1</string>
     </dict>
 
     <key>RunAtLoad</key>

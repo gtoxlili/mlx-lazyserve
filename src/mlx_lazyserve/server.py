@@ -55,6 +55,40 @@ def _params(body: dict) -> dict:
     }
 
 
+def _split_multimodal(messages: list[dict]) -> tuple[list[dict], list[str]]:
+    """Flatten OpenAI message content into text + a list of image references.
+
+    Image parts (``{"type": "image_url", "image_url": {"url": ...}}``) are pulled
+    out so the vision engine can consume them separately; text parts are joined.
+    Plain string content passes through unchanged.
+    """
+    images: list[str] = []
+    clean: list[dict] = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            texts: list[str] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    texts.append(str(part))
+                    continue
+                ptype = part.get("type")
+                if ptype == "text":
+                    texts.append(part.get("text", ""))
+                elif ptype == "image_url":
+                    url = (part.get("image_url") or {}).get("url")
+                    if url:
+                        images.append(url)
+                elif ptype == "image":
+                    url = part.get("image") or part.get("url")
+                    if url:
+                        images.append(url)
+            clean.append({**message, "content": "\n".join(t for t in texts if t)})
+        else:
+            clean.append(message)
+    return clean, images
+
+
 def _chunk(cid: str, created: int, model: str, delta: dict, finish=None) -> str:
     obj = {
         "id": cid,
@@ -88,8 +122,9 @@ async def chat_completions(request: Request):
     _require_auth(request)
     body = await request.json()
     model = _resolve_model(body)
-    messages = body.get("messages") or []
+    messages, images = _split_multimodal(body.get("messages") or [])
     params = _params(body)
+    params["images"] = images
     cid = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
 
