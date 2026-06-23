@@ -14,3 +14,6 @@ logs/*.log
 
 # Maintenance-mode marker
 .maintenance
+
+# Real/production LaunchAgent plists (carry Tailscale IP + API keys)
+*.local.plist

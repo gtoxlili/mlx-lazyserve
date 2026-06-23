@@ -84,12 +84,22 @@ Point any OpenAI SDK at `http://<tailscale-ip>:41434/v1` and set the model to on
 
 ## Run as a service (24/7)
 
+`launchd/dev.influo.mlx-lazyserve.plist` is a committed **template** (binds `0.0.0.0`, no
+auth). For a real deployment, keep a gitignored `*.local.plist` with your Tailscale IP +
+an API key, and install that:
+
 ```bash
-cp launchd/dev.influo.mlx-lazyserve.plist ~/Library/LaunchAgents/
+cp launchd/dev.influo.mlx-lazyserve.local.plist ~/Library/LaunchAgents/dev.influo.mlx-lazyserve.plist
 launchctl load ~/Library/LaunchAgents/dev.influo.mlx-lazyserve.plist
+launchctl list | grep mlx          # confirm it's running
 ```
 
-A LaunchAgent runs inside your login session, so on a headless mini enable **auto-login** (System Settings → Users & Groups) — otherwise it won't start after a reboot with nobody logged in. Logs go to `logs/`.
+`*.local.plist` is gitignored, so your real IP/keys never get committed. A LaunchAgent runs
+inside your login session, so on a headless mini enable **auto-login** (System Settings →
+Users & Groups) — otherwise it won't start after a reboot with nobody logged in. Logs go to `logs/`.
+
+With `MLX_LAZYSERVE_API_KEYS` set, send `Authorization: Bearer <key>` on `/v1/*` and
+`/admin/*` (`/health` stays open).
 
 ## Big models on 24 GB — Metal wired-memory limit
 
