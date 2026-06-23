@@ -76,6 +76,7 @@ This is already set in the LaunchAgent plist, so the running service downloads m
 
 ```bash
 curl http://<tailscale-ip>:41434/v1/chat/completions \
+  -H 'Authorization: Bearer <key>' \
   -H 'Content-Type: application/json' \
   -d '{"model":"qwen3.5-9b","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
@@ -128,15 +129,18 @@ GPU/RAM and politely turns requests away:
 
 ```bash
 # pause: unload the model + reject inference with HTTP 503
-curl -X POST http://<tailscale-ip>:41434/admin/maintenance \
+curl -X POST http://127.0.0.1:41434/admin/maintenance \
+  -H 'Authorization: Bearer <key>' \
   -H 'Content-Type: application/json' -d '{"enabled": true}'
 
 # resume
-curl -X POST http://<tailscale-ip>:41434/admin/maintenance \
+curl -X POST http://127.0.0.1:41434/admin/maintenance \
+  -H 'Authorization: Bearer <key>' \
   -H 'Content-Type: application/json' -d '{"enabled": false}'
 
 # check
-curl http://<tailscale-ip>:41434/admin/maintenance
+curl http://127.0.0.1:41434/admin/maintenance \
+  -H 'Authorization: Bearer <key>'
 ```
 
 While paused, `/v1/chat/completions` returns `503` with an OpenAI-style error
