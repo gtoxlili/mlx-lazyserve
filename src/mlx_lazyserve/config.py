@@ -73,7 +73,7 @@ def load_settings() -> Settings:
         host=os.environ.get("MLX_LAZYSERVE_HOST", "127.0.0.1"),
         port=int(os.environ.get("MLX_LAZYSERVE_PORT", "41434")),
         idle_timeout=float(os.environ.get("MLX_LAZYSERVE_IDLE_TIMEOUT", "600")),
-        default_max_tokens=int(os.environ.get("MLX_LAZYSERVE_MAX_TOKENS", "2048")),
+        default_max_tokens=int(os.environ.get("MLX_LAZYSERVE_MAX_TOKENS", "8192")),
         wired_limit_mb=int(os.environ.get("MLX_LAZYSERVE_WIRED_LIMIT_MB", "0")),
         api_keys=api_keys,
         models=models,

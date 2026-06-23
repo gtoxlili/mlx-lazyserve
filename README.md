@@ -66,7 +66,7 @@ This is already set in the LaunchAgent plist, so the running service downloads m
 | `MLX_LAZYSERVE_HOST` | `127.0.0.1` | bind address (`0.0.0.0` or your Tailscale IP to expose) |
 | `MLX_LAZYSERVE_PORT` | `41434` | port (high, avoids dev-server clashes) |
 | `MLX_LAZYSERVE_IDLE_TIMEOUT` | `600` | seconds idle before unloading (`0` = never) |
-| `MLX_LAZYSERVE_MAX_TOKENS` | `2048` | default max output tokens |
+| `MLX_LAZYSERVE_MAX_TOKENS` | `8192` | default max output tokens (headroom for reasoning models; per-request `max_tokens` overrides) |
 | `MLX_LAZYSERVE_WIRED_LIMIT_MB` | `0` | if > 0, set Metal wired limit on start, reset on stop |
 | `MLX_LAZYSERVE_API_KEYS` | *(empty)* | comma-separated bearer tokens; empty = no auth |
 | `MLX_LAZYSERVE_MODELS` | `./models.toml` | path to the model registry |
