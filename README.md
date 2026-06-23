@@ -92,6 +92,12 @@ re-resolve/lock on each restart), so sync the env once at deploy time:
 uv sync --extra vision     # one-time / after dependency changes
 ```
 
+> Why `uv run` and not `.venv/bin/mlx-lazyserve` directly? The project lives in
+> `~/Downloads`, a macOS **TCC-protected** folder — a launchd agent running the venv's
+> python there is denied (`Operation not permitted`, with no prompt). `uv` (in
+> `/opt/homebrew`) holds the granted access and its child inherits it. Moving the project
+> out of `~/Downloads` lets you run the entry point directly.
+
 `launchd/dev.influo.mlx-lazyserve.plist` is a committed **template** (binds `0.0.0.0`, no
 auth). For a real deployment, keep a gitignored `*.local.plist` with your Tailscale IP +
 an API key, and install that:

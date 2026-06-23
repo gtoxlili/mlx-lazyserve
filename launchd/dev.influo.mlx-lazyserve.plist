@@ -5,6 +5,11 @@
     <key>Label</key>
     <string>dev.influo.mlx-lazyserve</string>
 
+    <!-- Launch via `uv run` (not the venv entry point directly): the project lives in
+         ~/Downloads, a TCC-protected folder, and a launchd agent running .venv/bin/python
+         there is denied ("Operation not permitted", no prompt). uv (in /opt/homebrew) holds
+         the granted access and its child python inherits it. --no-sync = use the venv as-is.
+         (Cleaner long-term: move the project out of ~/Downloads and run the entry directly.) -->
     <key>ProgramArguments</key>
     <array>
         <string>/opt/homebrew/bin/uv</string>

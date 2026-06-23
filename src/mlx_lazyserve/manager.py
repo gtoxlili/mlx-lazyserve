@@ -24,7 +24,11 @@ class ModelManager:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._lock = threading.RLock()
+        # Plain Lock (not RLock): the streaming generator holds this across yields that
+        # Starlette drives on DIFFERENT threadpool threads, so it must be releasable from
+        # a thread other than the one that acquired it. RLock forbids that and would leave
+        # the lock orphaned (held forever) → every later request then deadlocks on it.
+        self._lock = threading.Lock()
         self._model = None
         self._model_name: str | None = None
         self._last_used = time.monotonic()
@@ -36,12 +40,10 @@ class ModelManager:
             ).start()
 
     def current_name(self) -> str | None:
-        with self._lock:
-            return self._model_name
+        return self._model_name  # atomic read, lock-free so /health never blocks on a generation
 
     def is_paused(self) -> bool:
-        with self._lock:
-            return self._paused
+        return self._paused  # atomic read, lock-free so the async event loop never blocks here
 
     def pause(self) -> None:
         """Enter maintenance mode: free the loaded model and refuse new work."""
