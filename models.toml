@@ -1,0 +1,31 @@
+# Model registry for mlx-lazyserve.
+# Friendly name -> Hugging Face MLX repo. Weights download lazily on first use
+# (cached in ~/.cache/huggingface) and unload after the idle timeout.
+#
+#   engine = "auto"     try mlx-lm, fall back to mlx-vlm  (good default)
+#            "mlx_lm"   force the text engine
+#            "mlx_vlm"  force the vision-language engine (required for image input)
+
+[models."qwen3.5-9b"]
+# Your exact HauhauCS pick, community-converted to MLX (mxfp4, ~5 GB).
+repo = "TheCluster/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-MLX-mxfp4"
+engine = "auto"
+default = true
+
+[models."gemma4-12b-qat"]
+# Stock Google Gemma 4 12B, QAT 4-bit (~7 GB). Not abliterated.
+repo = "mlx-community/gemma-4-12B-it-qat-4bit"
+engine = "auto"
+
+[models."gemma4-26b-uncensored"]
+# Uncensored Gemma 4 26B-A4B MoE, MLX 4-bit (~15 GB). Different lineage than HauhauCS.
+repo = "Jiunsong/supergemma4-26b-uncensored-mlx-4bit-v2"
+engine = "auto"
+
+[models."qwen3.6-35b-a3b"]
+# Qwen 3.6 35B-A3B (MoE, ~3B active), "Heretic" abliteration, MLX.
+# mixed-3.9bit ~18.7 GB; the 4bit quant is ~20.4 GB. Biggest-capability pick that
+# fits 24 GB, but needs a raised Metal wired limit (iogpu.wired_limit_mb~22000)
+# and a modest context. The idle-unload frees this ~19 GB when not in use.
+repo = "TheCluster/Qwen3.6-35B-A3B-Heretic-MLX-mixed-3.9bit"
+engine = "auto"

@@ -1,0 +1,24 @@
+[project]
+name = "mlx-lazyserve"
+version = "0.1.0"
+description = "Ollama-style, lazy-loading MLX inference server (OpenAI-compatible) for Apple Silicon"
+readme = "README.md"
+authors = [
+    { name = "gtoxlili", email = "gtoxlili@outlook.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.138.0",
+    "mlx-lm>=0.31.3",
+    "uvicorn[standard]>=0.49.0",
+]
+
+[project.optional-dependencies]
+vision = ["mlx-vlm>=0.4.3"]
+
+[project.scripts]
+mlx-lazyserve = "mlx_lazyserve:main"
+
+[build-system]
+requires = ["uv_build>=0.11.23,<0.12.0"]
+build-backend = "uv_build"
