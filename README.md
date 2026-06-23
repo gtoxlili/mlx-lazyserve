@@ -110,6 +110,17 @@ prompt once to authorize `uv`/Python — click Allow. Logs go to `logs/`.
 With `MLX_LAZYSERVE_API_KEYS` set, send `Authorization: Bearer <key>` on `/v1/*` and
 `/admin/*` (`/health` stays open).
 
+## Reverse proxy (nginx)
+
+[`deploy/nginx/mlx-lazyserve.conf`](deploy/nginx/mlx-lazyserve.conf) is an nginx vhost for
+exposing the service publicly: **Cloudflare (Full strict) → nginx → Tailscale →
+`office:41434`**. Streaming-friendly (no buffering, 600s timeout on `/v1/chat/completions`),
+forwards the `Authorization` bearer, allows 25 MB bodies for image uploads.
+
+Drop it in nginx `conf.d/`, set `server_name` + a Cloudflare DNS record, then
+`nginx -t && nginx -s reload`. Cloudflare's proxy has a ~100s first-byte timeout — prefer
+streaming (`stream:true`) for long generations, or grey-cloud / Tunnel that subdomain.
+
 ## Big models on 24 GB — Metal wired-memory limit
 
 macOS caps the GPU at ~75% of unified memory — measured **17.76 GB** on this M4 Pro
