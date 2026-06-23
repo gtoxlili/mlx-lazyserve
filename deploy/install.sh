@@ -73,8 +73,22 @@ cat > "$PLIST" <<PLIST
 PLIST
 
 echo "==> (re)bootstrap LaunchAgent"
-launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
+DOMAIN="gui/$(id -u)"
+launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+# bootout is ASYNCHRONOUS: the old instance may still be tearing down. Bootstrapping while
+# it's mid-teardown fails with "Bootstrap failed: 5: Input/output error" and leaves the job
+# UNLOADED (service down). Retry until the fresh instance takes.
+bootstrapped=0
+for _ in $(seq 1 20); do
+    if launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null; then bootstrapped=1; break; fi
+    sleep 0.5
+done
+if [ "$bootstrapped" -ne 1 ]; then
+    echo "error: launchctl bootstrap kept failing; last error below:"
+    launchctl bootstrap "$DOMAIN" "$PLIST" || true
+    exit 1
+fi
+launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 || { echo "error: job not running after bootstrap"; exit 1; }
 
 echo "==> done. runtime=$RUNTIME"
 echo "    logs:   tail -f $RUNTIME/logs/stderr.log"
