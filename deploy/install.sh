@@ -83,10 +83,14 @@ launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
 # GONE from launchd (`launchctl print` fails) AND the port is free, force-killing a straggler
 # that overstays ~15s (slow uvicorn drain / big-model unload).
 for i in $(seq 1 80); do
-    deregistered=1; launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 && deregistered=0
-    pid="$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1)"
-    [ "$deregistered" = 1 ] && [ -z "$pid" ] && break
-    [ -n "$pid" ] && [ "$i" -ge 30 ] && kill -9 "$pid" 2>/dev/null || true
+    # `|| true`: a non-zero lsof (no listener -> exit 1, amplified by pipefail) in a
+    # command-substitution ASSIGNMENT would otherwise trip `set -e` and abort the whole
+    # deploy the instant the port frees. Use `if` (set -e-safe) for the break/kill tests.
+    pid="$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)"
+    if ! launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 && [ -z "$pid" ]; then
+        break
+    fi
+    if [ -n "$pid" ] && [ "$i" -ge 30 ]; then kill -9 "$pid" 2>/dev/null || true; fi
     sleep 0.5
 done
 bootstrapped=0
