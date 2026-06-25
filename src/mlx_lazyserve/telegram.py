@@ -34,6 +34,7 @@ import threading
 from dataclasses import dataclass, field
 
 from .config import Settings
+from .engine import trim_degenerate
 from .manager import ModelManager
 
 logger = logging.getLogger("mlx_lazyserve.telegram")
@@ -713,6 +714,12 @@ class TelegramBot:
                 await self._send_plain(chat_id, "（模型返回了空回复）", reply_to)
                 continue
 
+            # Collapse any degenerate repetition run BEFORE storing/sending: a stored loop
+            # would re-prime the model on the next turn (history poisoning), and nobody wants
+            # a wall of repeats in the chat. No-op on normal replies.
+            text = trim_degenerate(text)
+            reasoning = trim_degenerate(reasoning)
+
             turn = batch_msgs + [{"role": "assistant", "content": text}]
             chan.history.extend(turn)
             self._trim_history(chan)
@@ -796,6 +803,12 @@ class TelegramBot:
             # Bot KV is quantized harder than the API (default 4-bit vs 8): chats are frequent
             # and short, so the smaller cache trims memory/bandwidth at a tiny quality cost.
             "kv_bits": self.settings.tg_kv_bits,
+            # Curb degenerate repetition loops: penalize repeats over a context window, keep a
+            # min-p floor, and (as a backstop) cut generation if it still falls into a loop.
+            "repetition_penalty": self.settings.tg_repetition_penalty,
+            "repetition_context_size": self.settings.repetition_context_size,
+            "min_p": self.settings.tg_min_p,
+            "loop_guard": self.settings.loop_guard,
             # Trim oldest history so prompt + reserved output fit the model's context window.
             "max_prompt_tokens": self._prompt_budget(model),
         }

@@ -99,15 +99,19 @@ def _params(body: dict) -> dict:
         "temperature": float(body.get("temperature", 0.7)),
         "top_p": float(body.get("top_p", 0.95)),
         "kv_bits": int(body.get("kv_bits", settings.default_kv_bits) or 0),
+        # Anti-repetition defaults (Ollama-style). Clients may override both — send
+        # repetition_penalty 1.0 to disable the penalty, loop_guard false to opt out.
+        "repetition_penalty": float(
+            body.get("repetition_penalty", settings.default_repetition_penalty)
+        ),
+        "repetition_context_size": settings.repetition_context_size,
+        "min_p": float(body.get("min_p", settings.default_min_p)),
+        "loop_guard": bool(body.get("loop_guard", settings.loop_guard)),
     }
     if body.get("top_k") is not None:
         p["top_k"] = int(body["top_k"])
-    if body.get("min_p") is not None:
-        p["min_p"] = float(body["min_p"])
     if body.get("seed") is not None:
         p["seed"] = int(body["seed"])
-    if body.get("repetition_penalty") is not None:
-        p["repetition_penalty"] = float(body["repetition_penalty"])
     if body.get("presence_penalty") is not None:
         p["presence_penalty"] = float(body["presence_penalty"])
     if body.get("frequency_penalty") is not None:
@@ -336,6 +340,8 @@ async def chat_completions(request: Request):
     # structured output emits JSON directly — incompatible with free-form <think> reasoning
     params["enable_thinking"] = False if structured else _enable_thinking(body)
     params["response_format"] = rf if structured else None
+    if structured:
+        params["loop_guard"] = False  # never truncate grammar-constrained JSON mid-stream
     cid = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     abort = threading.Event()

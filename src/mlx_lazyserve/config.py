@@ -27,6 +27,10 @@ class Settings:
     default_max_tokens: int
     default_enable_thinking: bool  # default for the chat-template thinking switch
     default_kv_bits: int  # if > 0, quantize the KV cache to N bits (saves memory)
+    default_repetition_penalty: float  # default penalty applied when a request omits it
+    default_min_p: float  # default min-p sampling floor for the API (0 = off)
+    repetition_context_size: int  # tokens the repetition penalty looks back over
+    loop_guard: bool  # stop generation if the output degenerates into a repeat loop
     wired_limit_mb: int  # if > 0, raise iogpu.wired_limit_mb on start, reset to 0 on stop
     api_keys: tuple[str, ...]  # bearer tokens; empty tuple = no auth (rely on Tailscale)
     models: dict[str, ModelSpec]
@@ -38,6 +42,8 @@ class Settings:
     tg_system_prompt: str  # system persona prepended to every conversation
     tg_max_tokens: int  # max output tokens per reply
     tg_kv_bits: int  # KV-cache quantization for bot generation (e.g. 4); 0 = unquantized
+    tg_repetition_penalty: float  # repetition penalty for bot replies (curbs loops)
+    tg_min_p: float  # min-p sampling floor for bot replies
     tg_history_turns: int  # per-(chat,user) (user,assistant) pairs kept as context
     tg_enable_thinking: bool  # if true, render reasoning as an expandable blockquote
     tg_db_path: Path  # SQLite file persisting per-(chat,user) conversation history
@@ -114,6 +120,13 @@ def _str_env(name: str, default: str) -> str:
     return raw if (raw and raw.strip()) else default
 
 
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return float(raw)
+
+
 def load_settings() -> Settings:
     models, default_model = _load_models()
     api_keys = tuple(
@@ -140,6 +153,10 @@ def load_settings() -> Settings:
         .lower()
         in ("1", "true", "yes", "on"),
         default_kv_bits=int(os.environ.get("MLX_LAZYSERVE_KV_BITS", "0")),
+        default_repetition_penalty=_float_env("MLX_LAZYSERVE_REPETITION_PENALTY", 1.1),
+        default_min_p=_float_env("MLX_LAZYSERVE_MIN_P", 0.0),
+        repetition_context_size=_int_env("MLX_LAZYSERVE_REPETITION_CONTEXT", 64),
+        loop_guard=_bool_env("MLX_LAZYSERVE_LOOP_GUARD", True),
         wired_limit_mb=int(os.environ.get("MLX_LAZYSERVE_WIRED_LIMIT_MB", "0")),
         api_keys=api_keys,
         models=models,
@@ -155,6 +172,11 @@ def load_settings() -> Settings:
             _int_env("MLX_LAZYSERVE_MAX_TOKENS", 8192),
         ),
         tg_kv_bits=_int_env("MLX_LAZYSERVE_TG_KV_BITS", 4),
+        tg_repetition_penalty=_float_env(
+            "MLX_LAZYSERVE_TG_REPETITION_PENALTY",
+            _float_env("MLX_LAZYSERVE_REPETITION_PENALTY", 1.1),
+        ),
+        tg_min_p=_float_env("MLX_LAZYSERVE_TG_MIN_P", 0.05),
         tg_history_turns=_int_env("MLX_LAZYSERVE_TG_HISTORY_TURNS", 8),
         tg_db_path=tg_db_path,
         tg_enable_thinking=_bool_env(

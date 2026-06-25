@@ -2,8 +2,9 @@
 
 A loaded model exposes ``.stream(messages, *, max_tokens, temperature, top_p,
 images=None, tools=None, enable_thinking=False, top_k, min_p, seed,
-repetition_penalty, presence_penalty, frequency_penalty, logit_bias, stop,
-response_format, kv_bits, max_prompt_tokens)`` which yields **typed events**:
+repetition_penalty, presence_penalty, frequency_penalty, repetition_context_size,
+logit_bias, stop, response_format, kv_bits, loop_guard, max_prompt_tokens)`` which
+yields **typed events**:
 
     {"reasoning": str}    incremental thinking text (only when enable_thinking)
     {"content": str}      incremental answer text
@@ -145,6 +146,78 @@ def _close(it) -> None:
             pass
 
 
+# --- repetition / degeneration guard ------------------------------------------------
+#
+# A degraded model (heavy quant, abliteration) can fall into a degenerate loop, emitting
+# the same short block forever (e.g. "傲娇傲娇傲娇…"). A ``repetition_penalty`` usually
+# prevents it, but as a model-agnostic backstop we also watch the decoded stream and cut
+# generation when a short cycle repeats far past anything a real answer would contain.
+# The same detector powers ``trim_degenerate`` so a looped reply never reaches the user
+# or the bot's saved history (a stored loop would re-prime it on the next turn).
+_LOOP_MAX_PERIOD = 32  # longest repeating block (chars) we scan for
+_LOOP_MIN_REPEATS = 4  # need at least this many back-to-back copies, ...
+_LOOP_MIN_RUN_CHARS = 60  # ...and the whole run must span at least this many chars
+_LOOP_TAIL_WINDOW = 512  # only inspect this many trailing chars while streaming
+_LOOP_KEEP_CYCLES = 3  # cycles kept when collapsing a run for display/history
+
+
+def _trailing_run(s: str):
+    """Longest run of a ``≤_LOOP_MAX_PERIOD``-char block repeated at the END of ``s``.
+
+    Returns ``(run_chars, period, repeats)`` for the run spanning the most characters
+    (ties prefer the shortest period — the tightest cycle), or ``None`` when ``s`` is empty.
+    """
+    n = len(s)
+    best = None
+    for period in range(1, min(_LOOP_MAX_PERIOD, n // 2) + 1):
+        seg = s[n - period : n]
+        reps, i = 1, n - period
+        while i - period >= 0 and s[i - period : i] == seg:
+            reps += 1
+            i -= period
+        run_chars = reps * period
+        if best is None or run_chars > best[0]:
+            best = (run_chars, period, reps)
+    return best
+
+
+def _is_degenerate(s: str) -> bool:
+    run = _trailing_run(s)
+    return bool(run and run[2] >= _LOOP_MIN_REPEATS and run[0] >= _LOOP_MIN_RUN_CHARS)
+
+
+def trim_degenerate(text: str) -> str:
+    """Collapse a trailing degenerate repetition run to a few cycles + an ellipsis.
+
+    No-op on normal text. Lets the bot keep a looped reply out of both the chat and the
+    persisted history (a stored loop would re-prime the model on the next turn).
+    """
+    run = _trailing_run(text or "")
+    if not (run and run[2] >= _LOOP_MIN_REPEATS and run[0] >= _LOOP_MIN_RUN_CHARS):
+        return text
+    run_chars, period, _ = run
+    start = len(text) - run_chars
+    return text[:start] + text[start : start + period] * _LOOP_KEEP_CYCLES + "…"
+
+
+def _loop_guarded(raw_iter: Iterator[str]) -> Iterator[str]:
+    """Pass text deltas through, halting the generator if the output degenerates into a loop."""
+    tail = ""
+    try:
+        for text in raw_iter:
+            yield text
+            if not text:
+                continue
+            tail = (tail + text)[-_LOOP_TAIL_WINDOW:]
+            if _is_degenerate(tail):
+                logger.warning("degeneration loop detected; halting generation")
+                break
+    except GeneratorExit:
+        _close(raw_iter)
+        raise
+    _close(raw_iter)
+
+
 def _fit_prompt(messages, build, token_len, max_prompt_tokens):
     """Drop the oldest non-system messages until the built prompt fits ``max_prompt_tokens``.
 
@@ -180,7 +253,12 @@ def _build_sampler(temperature, top_p, top_k, min_p):
 
 
 def _build_logits_processors(
-    logit_bias, repetition_penalty, presence_penalty, frequency_penalty, structured
+    logit_bias,
+    repetition_penalty,
+    presence_penalty,
+    frequency_penalty,
+    repetition_context_size,
+    structured,
 ):
     """mlx-lm logit-bias/penalty processors + an optional structured-output processor."""
     procs: list = []
@@ -190,14 +268,15 @@ def _build_logits_processors(
     ):
         from mlx_lm.sample_utils import make_logits_processors
 
-        procs = list(
-            make_logits_processors(
-                logit_bias=logit_bias,
-                repetition_penalty=repetition_penalty,
-                presence_penalty=presence_penalty,
-                frequency_penalty=frequency_penalty,
-            )
-        )
+        kwargs: dict = {
+            "logit_bias": logit_bias,
+            "repetition_penalty": repetition_penalty,
+            "presence_penalty": presence_penalty,
+            "frequency_penalty": frequency_penalty,
+        }
+        if repetition_context_size:
+            kwargs["repetition_context_size"] = int(repetition_context_size)
+        procs = list(make_logits_processors(**kwargs))
     if structured is not None:
         procs.append(structured)
     return procs or None
@@ -349,10 +428,12 @@ class MlxLmModel:
         repetition_penalty=None,
         presence_penalty=None,
         frequency_penalty=None,
+        repetition_context_size=None,
         logit_bias=None,
         stop=None,
         response_format=None,
         kv_bits=0,
+        loop_guard=True,
         max_prompt_tokens=None,
     ) -> Iterator[dict]:
         if images:
@@ -372,7 +453,12 @@ class MlxLmModel:
         hf_tok = getattr(self.tokenizer, "_tokenizer", self.tokenizer)
         structured = _build_structured(hf_tok, response_format)
         processors = _build_logits_processors(
-            logit_bias, repetition_penalty, presence_penalty, frequency_penalty, structured
+            logit_bias,
+            repetition_penalty,
+            presence_penalty,
+            frequency_penalty,
+            repetition_context_size,
+            structured,
         )
         _apply_seed(seed)
         gen_kw = {
@@ -393,7 +479,8 @@ class MlxLmModel:
                 usage,
             )
 
-        yield from _parse_events(raw(), enable_thinking, tool_module, tools, stop)
+        guarded = _loop_guarded(raw()) if loop_guard else raw()
+        yield from _parse_events(guarded, enable_thinking, tool_module, tools, stop)
         ev = _usage_event(usage)
         if ev:
             yield ev
@@ -492,10 +579,12 @@ class MlxVlmModel:
         repetition_penalty=None,
         presence_penalty=None,
         frequency_penalty=None,
+        repetition_context_size=None,
         logit_bias=None,
         stop=None,
         response_format=None,
         kv_bits=0,
+        loop_guard=True,
         max_prompt_tokens=None,
     ) -> Iterator[dict]:
         from mlx_vlm import stream_generate
@@ -511,7 +600,12 @@ class MlxVlmModel:
         hf_tok = getattr(self.processor, "tokenizer", self.processor)
         structured = _build_structured(hf_tok, response_format)
         processors = _build_logits_processors(
-            logit_bias, repetition_penalty, presence_penalty, frequency_penalty, structured
+            logit_bias,
+            repetition_penalty,
+            presence_penalty,
+            frequency_penalty,
+            repetition_context_size,
+            structured,
         )
         _apply_seed(seed)
         gen_kw = {
@@ -538,7 +632,8 @@ class MlxVlmModel:
                 usage,
             )
 
-        yield from _parse_events(raw(), enable_thinking, tool_module, tools, stop)
+        guarded = _loop_guarded(raw()) if loop_guard else raw()
+        yield from _parse_events(guarded, enable_thinking, tool_module, tools, stop)
         ev = _usage_event(usage)
         if ev:
             yield ev

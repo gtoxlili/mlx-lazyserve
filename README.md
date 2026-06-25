@@ -73,6 +73,10 @@ This is already set in the LaunchAgent plist, so the running service downloads m
 | `MLX_LAZYSERVE_MAX_TOKENS` | `8192` | default max output tokens (headroom for reasoning models; per-request `max_tokens` overrides) |
 | `MLX_LAZYSERVE_ENABLE_THINKING` | `false` | default thinking/reasoning state; per-request `enable_thinking` overrides |
 | `MLX_LAZYSERVE_KV_BITS` | `0` | if > 0 (e.g. `8`), quantize the KV cache → less memory / longer context, slight quality cost; per-request `kv_bits` overrides. Auto-falls-back to unquantized on sliding-window models (Gemma) that can't quantize a `RotatingKVCache` |
+| `MLX_LAZYSERVE_REPETITION_PENALTY` | `1.1` | default repetition penalty (Ollama-style) applied when a request omits one — curbs degenerate loops; per-request `repetition_penalty` overrides (`1.0` disables) |
+| `MLX_LAZYSERVE_REPETITION_CONTEXT` | `64` | tokens the repetition penalty looks back over |
+| `MLX_LAZYSERVE_MIN_P` | `0.0` | default min-p sampling floor (`0` = off); per-request `min_p` overrides |
+| `MLX_LAZYSERVE_LOOP_GUARD` | `true` | cut generation if the output degenerates into a repeat loop; per-request `loop_guard` overrides (auto-off for `response_format` JSON) |
 | `MLX_LAZYSERVE_WIRED_LIMIT_MB` | `0` | if > 0, set Metal wired limit on start, reset on stop |
 | `MLX_LAZYSERVE_API_KEYS` | *(empty)* | comma-separated bearer tokens; empty = no auth |
 | `MLX_LAZYSERVE_MODELS` | `./models.toml` | path to the model registry |
@@ -81,7 +85,9 @@ This is already set in the LaunchAgent plist, so the running service downloads m
 | `MLX_LAZYSERVE_TG_MODEL` | *(default model)* | **default** model the bot chats with (each user overrides via `/model`) |
 | `MLX_LAZYSERVE_TG_SYSTEM_PROMPT` | *(built-in)* | system persona for the bot |
 | `MLX_LAZYSERVE_TG_MAX_TOKENS` | `MAX_TOKENS` | max output tokens per bot reply |
-| `MLX_LAZYSERVE_TG_KV_BITS` | `4` | bot KV-cache quant bits (4 = fast/light, 8 = higher quality, 0 = off) |
+| `MLX_LAZYSERVE_TG_KV_BITS` | `4` | bot KV-cache quant bits (4 = fast/light, 8 = higher quality, 0 = off). Bump to `8` for steadier output if you don't switch to the 35B model |
+| `MLX_LAZYSERVE_TG_REPETITION_PENALTY` | `REPETITION_PENALTY` | repetition penalty for bot replies (these uncensored/abliterated builds loop easily) |
+| `MLX_LAZYSERVE_TG_MIN_P` | `0.05` | min-p sampling floor for bot replies |
 | `MLX_LAZYSERVE_TG_HISTORY_TURNS` | `8` | per-(group,user) turns kept as context |
 | `MLX_LAZYSERVE_TG_ENABLE_THINKING` | `false` | **default** for reasoning (each user overrides via `/think`); shown as an expandable blockquote |
 | `MLX_LAZYSERVE_TG_DB_PATH` | `./telegram-history.db` | SQLite file for per-(group,user) history (persists across restarts) |
@@ -155,6 +161,22 @@ output forces thinking off and can't be combined with `tools` (returns 400).
 Standard OpenAI knobs are honored: `temperature`, `top_p`, `top_k`, `min_p`, `seed`
 (reproducible), `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `logit_bias`,
 `stop` (string or list — truncates and halts), `max_tokens` / `max_completion_tokens`.
+
+**Anti-repetition (on by default).** These uncensored/abliterated, heavily-quantized builds
+are prone to **degeneration loops** (the model repeats one short phrase forever). Two defaults
+guard against it, both overridable per request:
+
+- A default **`repetition_penalty` of `1.1`** over a 64-token window (Ollama's defaults), applied
+  whenever a request omits one. Send `"repetition_penalty": 1.0` to disable, or tune the floor
+  with `MLX_LAZYSERVE_REPETITION_PENALTY` / `MLX_LAZYSERVE_REPETITION_CONTEXT`.
+- A model-agnostic **`loop_guard`** that halts generation if the decoded output still falls into a
+  short repeating cycle (so a loop can't run to `max_tokens`). It only trips on pathological runs
+  (a ≤32-char block repeated past ~60 chars), so normal repetition is untouched; it's auto-disabled
+  for `response_format` JSON. Turn it off with `"loop_guard": false` or `MLX_LAZYSERVE_LOOP_GUARD=false`.
+
+The embedded Telegram bot enables both too (`MLX_LAZYSERVE_TG_REPETITION_PENALTY`,
+`MLX_LAZYSERVE_TG_MIN_P`) and additionally **collapses** any leftover repetition before it's shown
+or saved — so a looped reply can't poison the next turn's history.
 
 ## Telegram bot
 
