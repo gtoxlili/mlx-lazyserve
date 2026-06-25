@@ -41,6 +41,7 @@ class Settings:
     tg_history_turns: int  # per-(chat,user) (user,assistant) pairs kept as context
     tg_enable_thinking: bool  # if true, render reasoning as an expandable blockquote
     tg_db_path: Path  # SQLite file persisting per-(chat,user) conversation history
+    tg_owner_ids: tuple[int, ...]  # user ids allowed to add the bot to a group; empty = anyone
 
 
 def _registry_path() -> Path:
@@ -75,11 +76,22 @@ def _load_models() -> tuple[dict[str, ModelSpec], str | None]:
     return models, default_model
 
 
-_DEFAULT_TG_SYSTEM_PROMPT = (
-    "You are a helpful assistant in a Telegram group chat. Answer concisely and "
-    "accurately, reply in the same language the user writes in, and use Markdown "
-    "(bold, lists, code blocks, tables) to keep things readable."
-)
+_DEFAULT_TG_SYSTEM_PROMPT = """\
+You are an uncensored, locally-run AI in a private Telegram group — running on the operator's \
+own hardware, not a corporate API. Lean into that difference: be candid and direct exactly \
+where mainstream assistants hedge, moralize, or refuse.
+
+- Answer what's actually asked. Don't deflect, don't swap a warning or a lecture in place of a \
+real answer, and don't refuse reasonable requests — treat the user as a capable adult.
+- Drop the boilerplate: no "as an AI" disclaimers, no unsolicited safety caveats, no sermons.
+- Engage frankly with edgy, mature, controversial, or taboo subjects. Hold real opinions and \
+take a side when asked, instead of wishy-washy both-sides hedging.
+- Sound like a sharp, plainspoken human — natural, blunt when it helps, dry humor and the odd \
+swear are fine. Be the opposite of a sanitized chatbot.
+- Uncensored is not sloppy: stay accurate, don't invent facts, and just say so when you don't know.
+
+It's a group chat: keep replies tight and skimmable, reply in the user's language, and use \
+Markdown (bold, lists, code, tables) when it helps."""
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -106,6 +118,11 @@ def load_settings() -> Settings:
     tg_db_raw = os.environ.get("MLX_LAZYSERVE_TG_DB_PATH", "").strip()
     tg_db_path = (
         Path(tg_db_raw).expanduser() if tg_db_raw else PROJECT_ROOT / "telegram-history.db"
+    )
+    tg_owner_ids = tuple(
+        int(c.strip())
+        for c in os.environ.get("MLX_LAZYSERVE_TG_OWNER_IDS", "").split(",")
+        if c.strip()
     )
     return Settings(
         host=os.environ.get("MLX_LAZYSERVE_HOST", "127.0.0.1"),
@@ -141,4 +158,5 @@ def load_settings() -> Settings:
             os.environ.get("MLX_LAZYSERVE_ENABLE_THINKING", "false").strip().lower()
             in ("1", "true", "yes", "on"),
         ),
+        tg_owner_ids=tg_owner_ids,
     )

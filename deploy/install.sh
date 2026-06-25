@@ -69,6 +69,7 @@ cat > "$PLIST" <<PLIST
         <key>MLX_LAZYSERVE_TG_KV_BITS</key><string>${MLX_LAZYSERVE_TG_KV_BITS:-4}</string>
         <key>MLX_LAZYSERVE_TG_HISTORY_TURNS</key><string>${MLX_LAZYSERVE_TG_HISTORY_TURNS:-8}</string>
         <key>MLX_LAZYSERVE_TG_ENABLE_THINKING</key><string>${MLX_LAZYSERVE_TG_ENABLE_THINKING:-false}</string>
+        <key>MLX_LAZYSERVE_TG_OWNER_IDS</key><string>${MLX_LAZYSERVE_TG_OWNER_IDS:-}</string>
         <key>MLX_LAZYSERVE_TG_DB_PATH</key><string>${MLX_LAZYSERVE_TG_DB_PATH:-${RUNTIME}/telegram-history.db}</string>
         <key>HF_HUB_DISABLE_XET</key><string>${HF_HUB_DISABLE_XET:-1}</string>
     </dict>

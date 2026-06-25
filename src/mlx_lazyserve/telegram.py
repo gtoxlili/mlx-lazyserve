@@ -262,7 +262,7 @@ class TelegramBot:
                     "getUpdates",
                     offset=offset,
                     timeout=LONG_POLL_TIMEOUT,
-                    allowed_updates=["message", "callback_query"],
+                    allowed_updates=["message", "callback_query", "my_chat_member"],
                 )
             except asyncio.CancelledError:
                 raise
@@ -279,6 +279,8 @@ class TelegramBot:
                         self._handle_update(update)
                     elif "callback_query" in update:
                         self._spawn(self._handle_callback(update["callback_query"]))
+                    elif "my_chat_member" in update:
+                        self._spawn(self._handle_my_chat_member(update["my_chat_member"]))
                 except Exception:
                     logger.exception("error handling update %s", update.get("update_id"))
 
@@ -319,6 +321,28 @@ class TelegramBot:
         req = self._extract_request(message, chat_id, frm["id"], text)
         if req is not None:
             self.submit(req)
+
+    async def _handle_my_chat_member(self, upd: dict) -> None:
+        """Owner gate: leave any group we're added to by a non-owner (if an allowlist is set)."""
+        chat = upd.get("chat") or {}
+        if chat.get("type") not in ("group", "supergroup"):
+            return  # ignore private start/block transitions and channels
+        old = (upd.get("old_chat_member") or {}).get("status")
+        new = (upd.get("new_chat_member") or {}).get("status")
+        added = old in ("left", "kicked") and new in ("member", "administrator", "restricted")
+        if not added:
+            return  # promotion/demotion/leaving — not a fresh add
+        adder_id = (upd.get("from") or {}).get("id")
+        if self.settings.tg_owner_ids and adder_id not in self.settings.tg_owner_ids:
+            chat_id = chat.get("id")
+            logger.info("unauthorized add by user %s to chat %s; leaving", adder_id, chat_id)
+            await self._api_quiet(
+                "sendMessage",
+                chat_id=chat_id,
+                text="抱歉，我只接受授权用户的邀请，正在退出本群。",
+                link_preview_options={"is_disabled": True},
+            )
+            await self._api_quiet("leaveChat", chat_id=chat_id)
 
     def _extract_request(self, message: dict, chat_id, user_id, text: str) -> Incoming | None:
         if not text:

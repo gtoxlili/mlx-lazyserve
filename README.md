@@ -85,6 +85,7 @@ This is already set in the LaunchAgent plist, so the running service downloads m
 | `MLX_LAZYSERVE_TG_HISTORY_TURNS` | `8` | per-(group,user) turns kept as context |
 | `MLX_LAZYSERVE_TG_ENABLE_THINKING` | `false` | **default** for reasoning (each user overrides via `/think`); shown as an expandable blockquote |
 | `MLX_LAZYSERVE_TG_DB_PATH` | `./telegram-history.db` | SQLite file for per-(group,user) history (persists across restarts) |
+| `MLX_LAZYSERVE_TG_OWNER_IDS` | *(empty)* | comma-separated user ids allowed to add the bot to a group; anyone else → it auto-leaves (empty = no restriction) |
 
 ## API
 
@@ -198,6 +199,9 @@ replies-to-the-bot, and commands — exactly the bot's triggers — so it never 
   it drops the half-finished generation and re-runs over **both** messages (passed as separate
   native chat turns) — one coherent reply, not two.
 - **No streaming**: replies are sent whole.
+- **Add-gating**: set `MLX_LAZYSERVE_TG_OWNER_IDS` to the user ids allowed to add the bot to a
+  group — if anyone else adds it, it posts a short notice and **leaves immediately** (empty =
+  anyone can add). It only ever responds in groups; DMs are ignored.
 
 Commands: **`/model`** (choose your model), **`/think`** (toggle your reasoning), **`/reset`**
 (clear your context). The bot self-registers these on startup.
