@@ -81,9 +81,10 @@ This is already set in the LaunchAgent plist, so the running service downloads m
 | `MLX_LAZYSERVE_TG_MODEL` | *(default model)* | model the bot chats with |
 | `MLX_LAZYSERVE_TG_SYSTEM_PROMPT` | *(built-in)* | system persona for the bot |
 | `MLX_LAZYSERVE_TG_MAX_TOKENS` | `MAX_TOKENS` | max output tokens per bot reply |
+| `MLX_LAZYSERVE_TG_KV_BITS` | `4` | bot KV-cache quant bits (4 = fast/light, 8 = higher quality, 0 = off) |
 | `MLX_LAZYSERVE_TG_HISTORY_TURNS` | `8` | per-(group,user) turns kept as context |
 | `MLX_LAZYSERVE_TG_ENABLE_THINKING` | `false` | show the bot's reasoning as an expandable blockquote |
-| `MLX_LAZYSERVE_TG_ALLOWED_CHATS` | *(empty)* | comma-separated chat-id allowlist; empty = any group |
+| `MLX_LAZYSERVE_TG_DB_PATH` | `./telegram-history.db` | SQLite file for per-(group,user) history (persists across restarts) |
 
 ## API
 
@@ -182,14 +183,20 @@ replies-to-the-bot, and commands — exactly the bot's triggers — so it never 
   **expandable blockquotes**, over-long answers auto-split, and big code blocks become file
   attachments. While working, the bot sets a 👀 reaction + the "typing…" action and threads its
   reply onto your message.
-- **Per-user memory**: a short rolling history per (group, user); `/reset` clears yours.
+- **Per-user memory**: a short rolling history per (group, user), persisted to **SQLite** so it
+  survives restarts; `/reset` clears yours. History is kept to the last
+  `MLX_LAZYSERVE_TG_HISTORY_TURNS` turns, and the prompt is additionally trimmed (oldest first,
+  always keeping the system prompt + newest message) to fit the model's **context window** minus
+  the reserved output — so long pastes can't overflow the model. Set each model's window with
+  `context` in [`models.toml`](models.toml).
 - **Interrupt + merge**: if you send another message while it's still answering your previous one,
-  it drops the half-finished generation and answers the **combined** messages — one coherent reply,
-  not two.
+  it drops the half-finished generation and re-runs over **both** messages (passed as separate
+  native chat turns) — one coherent reply, not two.
 - **No streaming**: replies are sent whole.
 
-Tune it with the `MLX_LAZYSERVE_TG_*` env vars (table above). `MLX_LAZYSERVE_TG_ALLOWED_CHATS`
-locks the bot to specific group chat-ids so strangers can't add it and burn your GPU.
+Tune it with the `MLX_LAZYSERVE_TG_*` env vars (table above). By default the bot uses the fast
+`qwen3.5-9b` model with a **4-bit KV cache** for snappy chat replies (the OpenAI API path keeps
+its own `MLX_LAZYSERVE_KV_BITS`).
 
 ## Run as a service (24/7)
 

@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import re
+import sqlite3
 import threading
 from dataclasses import dataclass, field
 
@@ -39,6 +40,7 @@ LONG_POLL_TIMEOUT = 50  # seconds the getUpdates call parks server-side
 TYPING_INTERVAL = 4.0  # re-send "typing" before Telegram clears it (~5 s)
 MAX_MESSAGE_LEN = 4000  # < Telegram's 4096 hard cap (UTF-16 units), with headroom
 ACK_REACTION = "👀"  # reaction set on the triggering message while we think
+PROMPT_MARGIN = 256  # tokens held back from the context window (template/counting slack)
 
 
 @dataclass
@@ -58,9 +60,62 @@ class Channel:
     """
 
     pending: list[Incoming] = field(default_factory=list)  # received, not yet answered
-    history: list[dict] = field(default_factory=list)  # [{role, content}, ...]
+    history: list[dict] = field(default_factory=list)  # [{role, content}, ...] (cache of DB)
     abort: threading.Event | None = None  # set => a generation is in flight
     worker: asyncio.Task | None = None  # the loop draining `pending`
+    loaded: bool = False  # whether history was hydrated from the store yet
+
+
+class HistoryStore:
+    """Tiny SQLite store for per-(chat, user) conversation history.
+
+    All methods are synchronous and serialized by a lock; call them via ``asyncio.to_thread``
+    from the event loop so a disk write never blocks generation or polling.
+    """
+
+    def __init__(self, path: str) -> None:
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS messages("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, "
+            "user_id INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_user ON messages(chat_id, user_id, id)"
+        )
+        self._conn.commit()
+
+    def load(self, chat_id: int, user_id: int, limit: int) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT role, content FROM messages WHERE chat_id=? AND user_id=? "
+                "ORDER BY id DESC LIMIT ?",
+                (chat_id, user_id, limit),
+            ).fetchall()
+        return [{"role": r, "content": c} for r, c in reversed(rows)]
+
+    def append(self, chat_id: int, user_id: int, msgs: list[dict], cap: int) -> None:
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO messages(chat_id, user_id, role, content) VALUES(?,?,?,?)",
+                [(chat_id, user_id, m["role"], m["content"]) for m in msgs],
+            )
+            # Keep only the most recent `cap` rows for this (chat, user).
+            self._conn.execute(
+                "DELETE FROM messages WHERE chat_id=? AND user_id=? AND id NOT IN "
+                "(SELECT id FROM messages WHERE chat_id=? AND user_id=? ORDER BY id DESC LIMIT ?)",
+                (chat_id, user_id, chat_id, user_id, cap),
+            )
+            self._conn.commit()
+
+    def clear(self, chat_id: int, user_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM messages WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+            )
+            self._conn.commit()
 
 
 class TelegramBot:
@@ -75,6 +130,7 @@ class TelegramBot:
         self._client = None  # httpx.AsyncClient, set in run()
         self._closing = False  # set on shutdown: abort generations + stop workers
         self._bg: set[asyncio.Task] = set()  # strong refs so fire-and-forget tasks aren't GC'd
+        self._store: HistoryStore | None = None  # SQLite history, opened in run()
 
     def _spawn(self, coro) -> None:
         task = asyncio.create_task(coro)
@@ -99,6 +155,13 @@ class TelegramBot:
             return
 
         self._setup_markdown()
+        if self.settings.tg_db_path:
+            try:
+                self._store = HistoryStore(str(self.settings.tg_db_path))
+                logger.info("Telegram history persisted to %s", self.settings.tg_db_path)
+            except Exception as exc:
+                logger.warning("could not open history DB (%s); using in-memory history", exc)
+                self._store = None
         timeout = httpx.Timeout(LONG_POLL_TIMEOUT + 15.0, connect=10.0)
         async with httpx.AsyncClient(base_url=API_BASE, timeout=timeout) as client:
             self._client = client
@@ -188,8 +251,6 @@ class TelegramBot:
         if chat.get("type") not in ("group", "supergroup"):
             return  # groups only
         chat_id = chat.get("id")
-        if self.settings.tg_allowed_chats and chat_id not in self.settings.tg_allowed_chats:
-            return
         frm = message.get("from") or {}
         if frm.get("is_bot") or frm.get("id") is None:
             return
@@ -245,10 +306,18 @@ class TelegramBot:
         return base == "/reset" and (at == "" or at == self.username.lower())
 
     def _reset(self, chat_id, user_id) -> None:
-        chan = self.channels.get((chat_id, user_id))
-        if chan is not None:
-            chan.history.clear()
-            chan.pending.clear()
+        key = (chat_id, user_id)
+        chan = self.channels.get(key)
+        if chan is None:
+            chan = self.channels[key] = Channel()
+        chan.history.clear()
+        chan.pending.clear()
+        chan.loaded = True  # authoritative empty cache; don't re-hydrate the DB we just cleared
+        if self._store is not None:
+            try:
+                self._store.clear(chat_id, user_id)  # tiny delete; fine to run inline
+            except Exception as exc:
+                logger.warning("history clear failed: %s", exc)
 
     # ------------------------------------------------------------------ per-user queue
 
@@ -265,7 +334,7 @@ class TelegramBot:
 
     async def _worker(self, key: tuple[int, int]) -> None:
         chan = self.channels[key]
-        chat_id, _ = key
+        chat_id, user_id = key
         reacted: int | None = None
         while True:
             # Drain synchronously (no await) so submit() can't interleave and orphan a
@@ -277,10 +346,14 @@ class TelegramBot:
                     await self._react(chat_id, reacted, None)
                 return
 
-            user_text = "\n\n".join(m.text for m in batch if m.text).strip()
+            # Each Telegram message stays its own native user turn (no string concatenation);
+            # a merged batch is simply several consecutive user messages in the request.
+            batch_msgs = [{"role": "user", "content": m.text} for m in batch if m.text]
             reply_to = batch[-1].message_id
-            if not user_text:
+            if not batch_msgs:
                 continue
+
+            await self._ensure_loaded(chan, chat_id, user_id)
 
             # Arm the interrupt BEFORE any await, so a message arriving during the
             # acknowledgement round-trips still aborts this generation (no lost merge).
@@ -293,7 +366,7 @@ class TelegramBot:
             await self._react(chat_id, reply_to, ACK_REACTION)
             reacted = reply_to
 
-            messages = self._build_messages(chan.history, user_text)
+            messages = self._build_messages(chan.history, batch_msgs)
             typing_stop = asyncio.Event()
             typing = asyncio.create_task(self._typing_loop(chat_id, typing_stop))
             try:
@@ -321,17 +394,18 @@ class TelegramBot:
                 await self._send_plain(chat_id, "（模型返回了空回复）", reply_to)
                 continue
 
-            chan.history.append({"role": "user", "content": user_text})
-            chan.history.append({"role": "assistant", "content": text})
+            turn = batch_msgs + [{"role": "assistant", "content": text}]
+            chan.history.extend(turn)
             self._trim_history(chan)
+            await self._persist(chat_id, user_id, turn)
             await self._send_reply(chat_id, text, reasoning, reply_to)
 
-    def _build_messages(self, history: list[dict], user_text: str) -> list[dict]:
+    def _build_messages(self, history: list[dict], new_msgs: list[dict]) -> list[dict]:
         messages: list[dict] = []
         if self.settings.tg_system_prompt:
             messages.append({"role": "system", "content": self.settings.tg_system_prompt})
         messages.extend(history)
-        messages.append({"role": "user", "content": user_text})
+        messages.extend(new_msgs)
         return messages
 
     def _trim_history(self, chan: Channel) -> None:
@@ -339,7 +413,36 @@ class TelegramBot:
         if len(chan.history) > cap:
             del chan.history[: len(chan.history) - cap]
 
+    async def _ensure_loaded(self, chan: Channel, chat_id: int, user_id: int) -> None:
+        """Hydrate a channel's history from SQLite once, on first use after (re)start."""
+        if self._store is None or chan.loaded:
+            return
+        chan.loaded = True
+        try:
+            cap = max(0, self.settings.tg_history_turns) * 2
+            chan.history = await asyncio.to_thread(self._store.load, chat_id, user_id, cap)
+            if chan.history:
+                logger.info("restored %d history msgs for (%s,%s)", len(chan.history), chat_id, user_id)
+        except Exception as exc:
+            logger.warning("history load failed for (%s,%s): %s", chat_id, user_id, exc)
+
+    async def _persist(self, chat_id: int, user_id: int, turn: list[dict]) -> None:
+        if self._store is None:
+            return
+        try:
+            cap = max(0, self.settings.tg_history_turns) * 2
+            await asyncio.to_thread(self._store.append, chat_id, user_id, turn, cap)
+        except Exception as exc:
+            logger.warning("history persist failed for (%s,%s): %s", chat_id, user_id, exc)
+
     # ------------------------------------------------------------------ generation
+
+    def _prompt_budget(self) -> int:
+        """Max prompt tokens = model context window − reserved output − a small margin."""
+        spec = self.settings.models.get(self.model)
+        context = spec.context if spec else 8192
+        reserve = min(self.settings.tg_max_tokens, max(256, context // 2))
+        return max(1024, context - reserve - PROMPT_MARGIN)
 
     async def _generate(self, messages: list[dict], abort: threading.Event):
         """Run the blocking model stream in a thread, bridging events over a queue.
@@ -357,6 +460,11 @@ class TelegramBot:
             "temperature": 0.7,
             "top_p": 0.95,
             "enable_thinking": self.settings.tg_enable_thinking,
+            # Bot KV is quantized harder than the API (default 4-bit vs 8): chats are frequent
+            # and short, so the smaller cache trims memory/bandwidth at a tiny quality cost.
+            "kv_bits": self.settings.tg_kv_bits,
+            # Trim oldest history so prompt + reserved output fit the model's context window.
+            "max_prompt_tokens": self._prompt_budget(),
         }
 
         def produce() -> None:

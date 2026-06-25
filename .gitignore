@@ -15,6 +15,9 @@ logs/*.log
 # Maintenance-mode marker
 .maintenance
 
+# Telegram bot conversation history (SQLite + WAL sidecars)
+telegram-history.db*
+
 # Real/production LaunchAgent plists (carry Tailscale IP + API keys)
 *.local.plist
 

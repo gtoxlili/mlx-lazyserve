@@ -3,7 +3,7 @@
 A loaded model exposes ``.stream(messages, *, max_tokens, temperature, top_p,
 images=None, tools=None, enable_thinking=False, top_k, min_p, seed,
 repetition_penalty, presence_penalty, frequency_penalty, logit_bias, stop,
-response_format, kv_bits)`` which yields **typed events**:
+response_format, kv_bits, max_prompt_tokens)`` which yields **typed events**:
 
     {"reasoning": str}    incremental thinking text (only when enable_thinking)
     {"content": str}      incremental answer text
@@ -143,6 +143,29 @@ def _close(it) -> None:
             closer()
         except Exception:
             pass
+
+
+def _fit_prompt(messages, build, token_len, max_prompt_tokens):
+    """Drop the oldest non-system messages until the built prompt fits ``max_prompt_tokens``.
+
+    ``build(msgs)`` returns a prompt (str or token ids); ``token_len(prompt)`` counts its
+    tokens. A leading system message and the newest message are always kept. Returns the
+    final prompt. No-op when ``max_prompt_tokens`` is falsy or the prompt already fits.
+    """
+    prompt = build(messages)
+    if not max_prompt_tokens:
+        return prompt
+    msgs = list(messages)
+    while token_len(prompt) > max_prompt_tokens and len(msgs) > 1:
+        drop = next(
+            (i for i, m in enumerate(msgs) if not (isinstance(m, dict) and m.get("role") == "system")),
+            None,
+        )
+        if drop is None or drop >= len(msgs) - 1:  # only a system msg + the newest remain
+            break
+        del msgs[drop]
+        prompt = build(msgs)
+    return prompt
 
 
 def _build_sampler(temperature, top_p, top_k, min_p):
@@ -305,6 +328,11 @@ class MlxLmModel:
             logger.warning("apply_chat_template(tools/enable_thinking) failed (%s); plain", exc)
             return self.tokenizer.apply_chat_template(messages, add_generation_prompt=True)
 
+    def _prompt_token_len(self, prompt) -> int:
+        if isinstance(prompt, str):
+            return len(self.tokenizer.encode(prompt))
+        return len(prompt)  # already token ids
+
     def stream(
         self,
         messages,
@@ -325,6 +353,7 @@ class MlxLmModel:
         stop=None,
         response_format=None,
         kv_bits=0,
+        max_prompt_tokens=None,
     ) -> Iterator[dict]:
         if images:
             raise ValueError(
@@ -333,7 +362,12 @@ class MlxLmModel:
 
         from mlx_lm import stream_generate
 
-        prompt = self._build_prompt(messages, tools, enable_thinking)
+        prompt = _fit_prompt(
+            messages,
+            lambda ms: self._build_prompt(ms, tools, enable_thinking),
+            self._prompt_token_len,
+            max_prompt_tokens,
+        )
         tool_module = self._tool_module() if tools else None
         hf_tok = getattr(self.tokenizer, "_tokenizer", self.tokenizer)
         structured = _build_structured(hf_tok, response_format)
@@ -433,6 +467,15 @@ class MlxVlmModel:
                 self.processor, self.config, messages, num_images=num_images
             )
 
+    def _prompt_token_len(self, prompt) -> int:
+        if isinstance(prompt, str):
+            tok = getattr(self.processor, "tokenizer", self.processor)
+            try:
+                return len(tok.encode(prompt))
+            except Exception:
+                return max(1, len(prompt) // 4)  # rough fallback if encode is unavailable
+        return len(prompt)
+
     def stream(
         self,
         messages,
@@ -453,11 +496,17 @@ class MlxVlmModel:
         stop=None,
         response_format=None,
         kv_bits=0,
+        max_prompt_tokens=None,
     ) -> Iterator[dict]:
         from mlx_vlm import stream_generate
 
         image_refs = self._resolve_images(images)
-        prompt = self._build_prompt(messages, len(image_refs), tools, enable_thinking)
+        prompt = _fit_prompt(
+            messages,
+            lambda ms: self._build_prompt(ms, len(image_refs), tools, enable_thinking),
+            self._prompt_token_len,
+            max_prompt_tokens,
+        )
         tool_module = self._tool_module() if tools else None
         hf_tok = getattr(self.processor, "tokenizer", self.processor)
         structured = _build_structured(hf_tok, response_format)

@@ -16,6 +16,7 @@ class ModelSpec:
     repo: str  # Hugging Face MLX repo id
     engine: str = "auto"  # "auto" | "mlx_lm" | "mlx_vlm"
     default: bool = False
+    context: int = 8192  # context window (tokens); the bot trims prompts to fit it
 
 
 @dataclass(frozen=True)
@@ -36,9 +37,10 @@ class Settings:
     tg_model: str | None  # model to chat with; None = default_model
     tg_system_prompt: str  # system persona prepended to every conversation
     tg_max_tokens: int  # max output tokens per reply
+    tg_kv_bits: int  # KV-cache quantization for bot generation (e.g. 4); 0 = unquantized
     tg_history_turns: int  # per-(chat,user) (user,assistant) pairs kept as context
     tg_enable_thinking: bool  # if true, render reasoning as an expandable blockquote
-    tg_allowed_chats: tuple[int, ...]  # chat-id allowlist; empty = any group
+    tg_db_path: Path  # SQLite file persisting per-(chat,user) conversation history
 
 
 def _registry_path() -> Path:
@@ -63,6 +65,7 @@ def _load_models() -> tuple[dict[str, ModelSpec], str | None]:
                 repo=spec["repo"],
                 engine=spec.get("engine", "auto"),
                 default=bool(spec.get("default", False)),
+                context=int(spec.get("context", 8192)),
             )
             models[name] = ms
             if ms.default and default_model is None:
@@ -100,10 +103,9 @@ def load_settings() -> Settings:
         for k in os.environ.get("MLX_LAZYSERVE_API_KEYS", "").split(",")
         if k.strip()
     )
-    tg_allowed_chats = tuple(
-        int(c.strip())
-        for c in os.environ.get("MLX_LAZYSERVE_TG_ALLOWED_CHATS", "").split(",")
-        if c.strip()
+    tg_db_raw = os.environ.get("MLX_LAZYSERVE_TG_DB_PATH", "").strip()
+    tg_db_path = (
+        Path(tg_db_raw).expanduser() if tg_db_raw else PROJECT_ROOT / "telegram-history.db"
     )
     return Settings(
         host=os.environ.get("MLX_LAZYSERVE_HOST", "127.0.0.1"),
@@ -131,11 +133,12 @@ def load_settings() -> Settings:
             "MLX_LAZYSERVE_TG_MAX_TOKENS",
             _int_env("MLX_LAZYSERVE_MAX_TOKENS", 8192),
         ),
+        tg_kv_bits=_int_env("MLX_LAZYSERVE_TG_KV_BITS", 4),
         tg_history_turns=_int_env("MLX_LAZYSERVE_TG_HISTORY_TURNS", 8),
+        tg_db_path=tg_db_path,
         tg_enable_thinking=_bool_env(
             "MLX_LAZYSERVE_TG_ENABLE_THINKING",
             os.environ.get("MLX_LAZYSERVE_ENABLE_THINKING", "false").strip().lower()
             in ("1", "true", "yes", "on"),
         ),
-        tg_allowed_chats=tg_allowed_chats,
     )

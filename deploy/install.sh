@@ -31,6 +31,7 @@ rsync -a --delete \
   --exclude '.git/' --exclude '.venv/' --exclude 'logs/' \
   --exclude '*.local.plist' --exclude '__pycache__/' --exclude '*.pyc' \
   --exclude '.maintenance' --exclude 'deploy/service.env' \
+  --exclude 'telegram-history.db*' \
   "$SRC"/ "$RUNTIME"/
 
 echo "==> build runtime venv (uv sync --extra vision --extra telegram)"
@@ -65,9 +66,10 @@ cat > "$PLIST" <<PLIST
         <key>MLX_LAZYSERVE_TG_MODEL</key><string>${MLX_LAZYSERVE_TG_MODEL:-}</string>
         <key>MLX_LAZYSERVE_TG_SYSTEM_PROMPT</key><string>${MLX_LAZYSERVE_TG_SYSTEM_PROMPT:-}</string>
         <key>MLX_LAZYSERVE_TG_MAX_TOKENS</key><string>${MLX_LAZYSERVE_TG_MAX_TOKENS:-}</string>
+        <key>MLX_LAZYSERVE_TG_KV_BITS</key><string>${MLX_LAZYSERVE_TG_KV_BITS:-4}</string>
         <key>MLX_LAZYSERVE_TG_HISTORY_TURNS</key><string>${MLX_LAZYSERVE_TG_HISTORY_TURNS:-8}</string>
         <key>MLX_LAZYSERVE_TG_ENABLE_THINKING</key><string>${MLX_LAZYSERVE_TG_ENABLE_THINKING:-false}</string>
-        <key>MLX_LAZYSERVE_TG_ALLOWED_CHATS</key><string>${MLX_LAZYSERVE_TG_ALLOWED_CHATS:-}</string>
+        <key>MLX_LAZYSERVE_TG_DB_PATH</key><string>${MLX_LAZYSERVE_TG_DB_PATH:-${RUNTIME}/telegram-history.db}</string>
         <key>HF_HUB_DISABLE_XET</key><string>${HF_HUB_DISABLE_XET:-1}</string>
     </dict>
     <key>RunAtLoad</key><true/>
