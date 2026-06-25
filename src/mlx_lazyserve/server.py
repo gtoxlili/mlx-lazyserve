@@ -48,9 +48,23 @@ def _set_wired_limit(mb: int) -> None:
 async def lifespan(_app: FastAPI):
     if settings.wired_limit_mb > 0:
         _set_wired_limit(settings.wired_limit_mb)
+    bot_stop: asyncio.Event | None = None
+    bot_task: asyncio.Task | None = None
+    if settings.tg_bot_token:
+        from .telegram import run_bot
+
+        bot_stop = asyncio.Event()
+        bot_task = asyncio.create_task(run_bot(settings, manager, bot_stop))
     try:
         yield
     finally:
+        if bot_task is not None:
+            bot_stop.set()
+            bot_task.cancel()
+            try:
+                await bot_task
+            except (asyncio.CancelledError, Exception):
+                pass
         manager.shutdown()
         if settings.wired_limit_mb > 0:
             _set_wired_limit(0)  # restore the default cap on graceful shutdown

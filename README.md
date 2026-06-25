@@ -22,6 +22,7 @@ This server keeps Ollama's best ergonomic — **lazy load + idle unload** — so
 - Optional bearer-token auth; otherwise rely on Tailscale for access control
 - Ships a `launchd` LaunchAgent for 24/7 operation
 - Maintenance mode: pause the service (free memory + reject requests) during scheduled heavy jobs
+- **Embedded Telegram bot** (optional): add it to a group and it answers @mentions / replies-to-it with rich formatting (Markdown→entities, expandable blockquotes, 👀 reactions, typing). Reuses the loaded model in-process; **interrupts + merges** if a user sends a follow-up mid-answer
 
 ## Models
 
@@ -76,6 +77,13 @@ This is already set in the LaunchAgent plist, so the running service downloads m
 | `MLX_LAZYSERVE_API_KEYS` | *(empty)* | comma-separated bearer tokens; empty = no auth |
 | `MLX_LAZYSERVE_MODELS` | `./models.toml` | path to the model registry |
 | `MLX_LAZYSERVE_PAUSE_FILE` | `./.maintenance` | maintenance-marker path (present = start paused) |
+| `MLX_LAZYSERVE_TG_BOT_TOKEN` | *(empty)* | BotFather token; empty = Telegram bot off (see [Telegram bot](#telegram-bot)) |
+| `MLX_LAZYSERVE_TG_MODEL` | *(default model)* | model the bot chats with |
+| `MLX_LAZYSERVE_TG_SYSTEM_PROMPT` | *(built-in)* | system persona for the bot |
+| `MLX_LAZYSERVE_TG_MAX_TOKENS` | `MAX_TOKENS` | max output tokens per bot reply |
+| `MLX_LAZYSERVE_TG_HISTORY_TURNS` | `8` | per-(group,user) turns kept as context |
+| `MLX_LAZYSERVE_TG_ENABLE_THINKING` | `false` | show the bot's reasoning as an expandable blockquote |
+| `MLX_LAZYSERVE_TG_ALLOWED_CHATS` | *(empty)* | comma-separated chat-id allowlist; empty = any group |
 
 ## API
 
@@ -145,6 +153,43 @@ output forces thinking off and can't be combined with `tools` (returns 400).
 Standard OpenAI knobs are honored: `temperature`, `top_p`, `top_k`, `min_p`, `seed`
 (reproducible), `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `logit_bias`,
 `stop` (string or list — truncates and halts), `max_tokens` / `max_completion_tokens`.
+
+## Telegram bot
+
+An optional Telegram bot is **embedded in the same process** — no second service. Add it to a
+group and it replies to any message that **@mentions it** or **replies to one of its messages**
+(it ignores unrelated chatter, other bots, and DMs). It calls the in-process model directly, so
+it shares the single model slot with the OpenAI API.
+
+### Setup
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.
+2. Set `MLX_LAZYSERVE_TG_BOT_TOKEN` (in `deploy/service.env` for the service, or your shell for
+   dev) and install the extra:
+   ```bash
+   uv sync --extra telegram      # dev; install.sh adds this automatically for the service
+   uv run mlx-lazyserve
+   ```
+3. Add the bot to a group and @mention it.
+
+**Group privacy can stay ON** (BotFather's default): Telegram still delivers @mentions,
+replies-to-the-bot, and commands — exactly the bot's triggers — so it never sees unrelated chatter.
+
+### Behavior
+
+- **Rich formatting** via recent Bot API features: the model's Markdown is converted to Telegram
+  message *entities* (no MarkdownV2 escaping glitches), long quotes/reasoning collapse into
+  **expandable blockquotes**, over-long answers auto-split, and big code blocks become file
+  attachments. While working, the bot sets a 👀 reaction + the "typing…" action and threads its
+  reply onto your message.
+- **Per-user memory**: a short rolling history per (group, user); `/reset` clears yours.
+- **Interrupt + merge**: if you send another message while it's still answering your previous one,
+  it drops the half-finished generation and answers the **combined** messages — one coherent reply,
+  not two.
+- **No streaming**: replies are sent whole.
+
+Tune it with the `MLX_LAZYSERVE_TG_*` env vars (table above). `MLX_LAZYSERVE_TG_ALLOWED_CHATS`
+locks the bot to specific group chat-ids so strangers can't add it and burn your GPU.
 
 ## Run as a service (24/7)
 

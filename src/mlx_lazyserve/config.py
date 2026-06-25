@@ -31,6 +31,14 @@ class Settings:
     models: dict[str, ModelSpec]
     default_model: str | None
     pause_file: Path  # marker file; if present the service starts in maintenance mode
+    # Telegram bot (embedded). Disabled unless tg_bot_token is set.
+    tg_bot_token: str  # BotFather token; empty = bot off
+    tg_model: str | None  # model to chat with; None = default_model
+    tg_system_prompt: str  # system persona prepended to every conversation
+    tg_max_tokens: int  # max output tokens per reply
+    tg_history_turns: int  # per-(chat,user) (user,assistant) pairs kept as context
+    tg_enable_thinking: bool  # if true, render reasoning as an expandable blockquote
+    tg_allowed_chats: tuple[int, ...]  # chat-id allowlist; empty = any group
 
 
 def _registry_path() -> Path:
@@ -64,12 +72,38 @@ def _load_models() -> tuple[dict[str, ModelSpec], str | None]:
     return models, default_model
 
 
+_DEFAULT_TG_SYSTEM_PROMPT = (
+    "You are a helpful assistant in a Telegram group chat. Answer concisely and "
+    "accurately, reply in the same language the user writes in, and use Markdown "
+    "(bold, lists, code blocks, tables) to keep things readable."
+)
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():  # missing or empty (e.g. an unset plist key) -> default
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return int(raw)
+
+
 def load_settings() -> Settings:
     models, default_model = _load_models()
     api_keys = tuple(
         k.strip()
         for k in os.environ.get("MLX_LAZYSERVE_API_KEYS", "").split(",")
         if k.strip()
+    )
+    tg_allowed_chats = tuple(
+        int(c.strip())
+        for c in os.environ.get("MLX_LAZYSERVE_TG_ALLOWED_CHATS", "").split(",")
+        if c.strip()
     )
     return Settings(
         host=os.environ.get("MLX_LAZYSERVE_HOST", "127.0.0.1"),
@@ -88,4 +122,20 @@ def load_settings() -> Settings:
         pause_file=Path(
             os.environ.get("MLX_LAZYSERVE_PAUSE_FILE", str(PROJECT_ROOT / ".maintenance"))
         ).expanduser(),
+        tg_bot_token=os.environ.get("MLX_LAZYSERVE_TG_BOT_TOKEN", "").strip(),
+        tg_model=(os.environ.get("MLX_LAZYSERVE_TG_MODEL", "").strip() or None),
+        tg_system_prompt=os.environ.get(
+            "MLX_LAZYSERVE_TG_SYSTEM_PROMPT", _DEFAULT_TG_SYSTEM_PROMPT
+        ),
+        tg_max_tokens=_int_env(
+            "MLX_LAZYSERVE_TG_MAX_TOKENS",
+            _int_env("MLX_LAZYSERVE_MAX_TOKENS", 8192),
+        ),
+        tg_history_turns=_int_env("MLX_LAZYSERVE_TG_HISTORY_TURNS", 8),
+        tg_enable_thinking=_bool_env(
+            "MLX_LAZYSERVE_TG_ENABLE_THINKING",
+            os.environ.get("MLX_LAZYSERVE_ENABLE_THINKING", "false").strip().lower()
+            in ("1", "true", "yes", "on"),
+        ),
+        tg_allowed_chats=tg_allowed_chats,
     )

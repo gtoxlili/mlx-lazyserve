@@ -33,8 +33,8 @@ rsync -a --delete \
   --exclude '.maintenance' --exclude 'deploy/service.env' \
   "$SRC"/ "$RUNTIME"/
 
-echo "==> build runtime venv (uv sync --extra vision)"
-"$UV" sync --project "$RUNTIME" --extra vision
+echo "==> build runtime venv (uv sync --extra vision --extra telegram)"
+"$UV" sync --project "$RUNTIME" --extra vision --extra telegram
 
 echo "==> render LaunchAgent from deploy/service.env"
 set -a; . "$ENV_FILE"; set +a
@@ -61,6 +61,13 @@ cat > "$PLIST" <<PLIST
         <key>MLX_LAZYSERVE_KV_BITS</key><string>${MLX_LAZYSERVE_KV_BITS:-0}</string>
         <key>MLX_LAZYSERVE_WIRED_LIMIT_MB</key><string>${MLX_LAZYSERVE_WIRED_LIMIT_MB:-0}</string>
         <key>MLX_LAZYSERVE_API_KEYS</key><string>${MLX_LAZYSERVE_API_KEYS:-}</string>
+        <key>MLX_LAZYSERVE_TG_BOT_TOKEN</key><string>${MLX_LAZYSERVE_TG_BOT_TOKEN:-}</string>
+        <key>MLX_LAZYSERVE_TG_MODEL</key><string>${MLX_LAZYSERVE_TG_MODEL:-}</string>
+        <key>MLX_LAZYSERVE_TG_SYSTEM_PROMPT</key><string>${MLX_LAZYSERVE_TG_SYSTEM_PROMPT:-}</string>
+        <key>MLX_LAZYSERVE_TG_MAX_TOKENS</key><string>${MLX_LAZYSERVE_TG_MAX_TOKENS:-}</string>
+        <key>MLX_LAZYSERVE_TG_HISTORY_TURNS</key><string>${MLX_LAZYSERVE_TG_HISTORY_TURNS:-8}</string>
+        <key>MLX_LAZYSERVE_TG_ENABLE_THINKING</key><string>${MLX_LAZYSERVE_TG_ENABLE_THINKING:-false}</string>
+        <key>MLX_LAZYSERVE_TG_ALLOWED_CHATS</key><string>${MLX_LAZYSERVE_TG_ALLOWED_CHATS:-}</string>
         <key>HF_HUB_DISABLE_XET</key><string>${HF_HUB_DISABLE_XET:-1}</string>
     </dict>
     <key>RunAtLoad</key><true/>
