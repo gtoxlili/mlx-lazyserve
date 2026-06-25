@@ -9,7 +9,8 @@ imported lazily so the core install stays lean.
 Behavior:
 - **Groups only.** Triggers when a message @mentions the bot or replies to one of the bot's
   messages. DMs, other bots, and the bot's own messages are ignored.
-- **Per-(chat, user) memory.** A short bounded conversation history per user.
+- **Per-(chat, user) memory + prefs.** A short bounded conversation history per user, plus each
+  user's own model (``/model``) and thinking toggle (``/think``) — all persisted to SQLite.
 - **Interrupt + merge.** If a user sends a new message while the bot is still generating
   *that user's* reply, the in-flight generation is aborted and a fresh one runs over the
   **merged** messages — so the user gets one coherent answer, not two.
@@ -63,7 +64,10 @@ class Channel:
     history: list[dict] = field(default_factory=list)  # [{role, content}, ...] (cache of DB)
     abort: threading.Event | None = None  # set => a generation is in flight
     worker: asyncio.Task | None = None  # the loop draining `pending`
-    loaded: bool = False  # whether history was hydrated from the store yet
+    loaded: bool = False  # whether history + prefs were hydrated from the store yet
+    load_lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # serialize hydration
+    model: str | None = None  # per-user model override (None = bot default)
+    thinking: bool | None = None  # per-user thinking override (None = bot default)
 
 
 class HistoryStore:
@@ -84,6 +88,11 @@ class HistoryStore:
         )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_chat_user ON messages(chat_id, user_id, id)"
+        )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS prefs("
+            "chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, "
+            "model TEXT, thinking INTEGER, PRIMARY KEY(chat_id, user_id))"
         )
         self._conn.commit()
 
@@ -117,13 +126,42 @@ class HistoryStore:
             )
             self._conn.commit()
 
+    def get_prefs(self, chat_id: int, user_id: int) -> tuple[str | None, bool | None]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT model, thinking FROM prefs WHERE chat_id=? AND user_id=?",
+                (chat_id, user_id),
+            ).fetchone()
+        if not row:
+            return None, None
+        model, thinking = row
+        return model, (None if thinking is None else bool(thinking))
+
+    def set_model(self, chat_id: int, user_id: int, model: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO prefs(chat_id, user_id, model) VALUES(?,?,?) "
+                "ON CONFLICT(chat_id, user_id) DO UPDATE SET model=excluded.model",
+                (chat_id, user_id, model),
+            )
+            self._conn.commit()
+
+    def set_thinking(self, chat_id: int, user_id: int, thinking: bool) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO prefs(chat_id, user_id, thinking) VALUES(?,?,?) "
+                "ON CONFLICT(chat_id, user_id) DO UPDATE SET thinking=excluded.thinking",
+                (chat_id, user_id, int(thinking)),
+            )
+            self._conn.commit()
+
 
 class TelegramBot:
     def __init__(self, settings: Settings, manager: ModelManager) -> None:
         self.settings = settings
         self.manager = manager
         self.token = settings.tg_bot_token
-        self.model = settings.tg_model or settings.default_model
+        self.default_model = settings.tg_model or settings.default_model  # per-user overridable
         self.bot_id = 0
         self.username = ""
         self.channels: dict[tuple[int, int], Channel] = {}
@@ -142,8 +180,10 @@ class TelegramBot:
     async def run(self, stop: asyncio.Event) -> None:
         if not self.token:
             return
-        if not self.model or self.model not in self.settings.models:
-            logger.error("Telegram bot: model %r is not configured; bot disabled", self.model)
+        if not self.default_model or self.default_model not in self.settings.models:
+            logger.error(
+                "Telegram bot: model %r is not configured; bot disabled", self.default_model
+            )
             return
         try:
             import httpx
@@ -173,13 +213,18 @@ class TelegramBot:
             self.bot_id = me["id"]
             self.username = me.get("username") or ""
             logger.info(
-                "Telegram bot @%s (id=%s) online; model=%s", self.username, self.bot_id, self.model
+                "Telegram bot @%s (id=%s) online; default model=%s",
+                self.username, self.bot_id, self.default_model,
             )
             # Drop any backlog so a restart doesn't replay stale @mentions.
             await self._api_quiet("deleteWebhook", drop_pending_updates=True)
             await self._api_quiet(
                 "setMyCommands",
-                commands=[{"command": "reset", "description": "清空与你的对话上下文 / clear our context"}],
+                commands=[
+                    {"command": "model", "description": "选择模型 / choose model"},
+                    {"command": "think", "description": "开关思考 / toggle reasoning"},
+                    {"command": "reset", "description": "清空上下文 / clear context"},
+                ],
             )
             try:
                 await self._poll_loop(stop)
@@ -217,7 +262,7 @@ class TelegramBot:
                     "getUpdates",
                     offset=offset,
                     timeout=LONG_POLL_TIMEOUT,
-                    allowed_updates=["message"],
+                    allowed_updates=["message", "callback_query"],
                 )
             except asyncio.CancelledError:
                 raise
@@ -230,7 +275,10 @@ class TelegramBot:
             for update in updates or []:
                 offset = update["update_id"] + 1
                 try:
-                    self._handle_update(update)
+                    if "message" in update:
+                        self._handle_update(update)
+                    elif "callback_query" in update:
+                        self._spawn(self._handle_callback(update["callback_query"]))
                 except Exception:
                     logger.exception("error handling update %s", update.get("update_id"))
 
@@ -256,11 +304,16 @@ class TelegramBot:
             return
 
         text = (message.get("text") or message.get("caption") or "").strip()
-        if self._is_reset_command(text):
-            self._reset(chat_id, frm["id"])
-            self._spawn(
-                self._send_plain(chat_id, "🧹 已清空我们的对话上下文。", message.get("message_id"))
-            )
+        cmd, arg = self._parse_command(text)
+        if cmd is not None:
+            uid, mid = frm["id"], message.get("message_id")
+            if cmd == "reset":
+                self._reset(chat_id, uid)
+                self._spawn(self._send_plain(chat_id, "🧹 已清空我们的对话上下文。", mid))
+            elif cmd == "model":
+                self._spawn(self._cmd_model(chat_id, uid, mid, arg))
+            elif cmd in ("think", "thinking"):
+                self._spawn(self._cmd_think(chat_id, uid, mid, arg))
             return
 
         req = self._extract_request(message, chat_id, frm["id"], text)
@@ -298,18 +351,25 @@ class TelegramBot:
             return text.strip()
         return re.sub(rf"@{re.escape(self.username)}\b", "", text, flags=re.IGNORECASE).strip()
 
-    def _is_reset_command(self, text: str) -> bool:
-        if not text:
-            return False
-        first = text.split(maxsplit=1)[0].lower()
-        base, _, at = first.partition("@")
-        return base == "/reset" and (at == "" or at == self.username.lower())
+    def _parse_command(self, text: str) -> tuple[str | None, str]:
+        """If text is a slash command addressed to us (or unqualified), return (name, arg)."""
+        if not text.startswith("/"):
+            return None, ""
+        head, _, arg = text.partition(" ")
+        base, _, at = head[1:].partition("@")
+        if at and at.lower() != self.username.lower():
+            return None, ""  # addressed to a different bot
+        return base.lower(), arg.strip()
 
-    def _reset(self, chat_id, user_id) -> None:
+    def _get_channel(self, chat_id: int, user_id: int) -> Channel:
         key = (chat_id, user_id)
         chan = self.channels.get(key)
         if chan is None:
             chan = self.channels[key] = Channel()
+        return chan
+
+    def _reset(self, chat_id, user_id) -> None:
+        chan = self._get_channel(chat_id, user_id)
         chan.history.clear()
         chan.pending.clear()
         chan.loaded = True  # authoritative empty cache; don't re-hydrate the DB we just cleared
@@ -319,13 +379,110 @@ class TelegramBot:
             except Exception as exc:
                 logger.warning("history clear failed: %s", exc)
 
+    # ------------------------------------------------------------------ commands / prefs
+
+    async def _cmd_model(self, chat_id, user_id, reply_to, arg: str) -> None:
+        """/model — pick the model this user chats with (inline keyboard, or /model <name>)."""
+        chan = self._get_channel(chat_id, user_id)
+        await self._ensure_loaded(chan, chat_id, user_id)
+        if arg:
+            if arg in self.settings.models:
+                chan.model = arg
+                await self._save_pref(chat_id, user_id, model=arg)
+                await self._send_plain(chat_id, f"✅ 你的模型已切到 {arg}", reply_to)
+            else:
+                opts = "、".join(self.settings.models)
+                await self._send_plain(chat_id, f"未知模型：{arg}\n可选：{opts}", reply_to)
+            return
+        current = chan.model or self.default_model
+        await self._api_quiet(
+            "sendMessage",
+            chat_id=chat_id,
+            text=f"你当前的模型：{current}\n点下面切换（每人独立）：",
+            reply_parameters={"message_id": reply_to, "allow_sending_without_reply": True},
+            reply_markup=self._model_keyboard(current),
+        )
+
+    async def _cmd_think(self, chat_id, user_id, reply_to, arg: str) -> None:
+        """/think — toggle this user's reasoning (inline keyboard, or /think on|off)."""
+        chan = self._get_channel(chat_id, user_id)
+        await self._ensure_loaded(chan, chat_id, user_id)
+        a = arg.lower()
+        if a in ("on", "1", "true", "开", "开启"):
+            chan.thinking = True
+            await self._save_pref(chat_id, user_id, thinking=True)
+            await self._send_plain(chat_id, "✅ 思考已开启", reply_to)
+            return
+        if a in ("off", "0", "false", "关", "关闭"):
+            chan.thinking = False
+            await self._save_pref(chat_id, user_id, thinking=False)
+            await self._send_plain(chat_id, "✅ 思考已关闭", reply_to)
+            return
+        current = chan.thinking if chan.thinking is not None else self.settings.tg_enable_thinking
+        await self._api_quiet(
+            "sendMessage",
+            chat_id=chat_id,
+            text=f"思考模式当前：{'开' if current else '关'}（每人独立）",
+            reply_parameters={"message_id": reply_to, "allow_sending_without_reply": True},
+            reply_markup=self._think_keyboard(current),
+        )
+
+    async def _handle_callback(self, cb: dict) -> None:
+        """Apply an inline-keyboard tap to the *tapper's* prefs; confirm via a private toast."""
+        cb_id = cb.get("id")
+        data = cb.get("data") or ""
+        chat_id = ((cb.get("message") or {}).get("chat") or {}).get("id")
+        user_id = (cb.get("from") or {}).get("id")
+        if chat_id is None or user_id is None:
+            await self._api_quiet("answerCallbackQuery", callback_query_id=cb_id)
+            return
+        chan = self._get_channel(chat_id, user_id)
+        await self._ensure_loaded(chan, chat_id, user_id)
+        if data.startswith("m:") and data[2:] in self.settings.models:
+            chan.model = data[2:]
+            await self._save_pref(chat_id, user_id, model=chan.model)
+            toast = f"✅ 模型已切到 {chan.model}"
+        elif data in ("t:1", "t:0"):
+            chan.thinking = data == "t:1"
+            await self._save_pref(chat_id, user_id, thinking=chan.thinking)
+            toast = "✅ 思考已开启" if chan.thinking else "✅ 思考已关闭"
+        else:
+            toast = None
+        await self._api_quiet("answerCallbackQuery", callback_query_id=cb_id, text=toast)
+
+    def _model_keyboard(self, current: str) -> dict:
+        rows = [
+            [{"text": ("✅ " if name == current else "") + name, "callback_data": f"m:{name}"}]
+            for name in self.settings.models
+        ]
+        return {"inline_keyboard": rows}
+
+    def _think_keyboard(self, current: bool) -> dict:
+        return {
+            "inline_keyboard": [[
+                {"text": ("✅ " if current else "") + "开启思考", "callback_data": "t:1"},
+                {"text": ("✅ " if not current else "") + "关闭思考", "callback_data": "t:0"},
+            ]]
+        }
+
+    async def _save_pref(
+        self, chat_id, user_id, *, model: str | None = None, thinking: bool | None = None
+    ) -> None:
+        if self._store is None:
+            return
+        try:
+            if model is not None:
+                await asyncio.to_thread(self._store.set_model, chat_id, user_id, model)
+            if thinking is not None:
+                await asyncio.to_thread(self._store.set_thinking, chat_id, user_id, thinking)
+        except Exception as exc:
+            logger.warning("save pref failed for (%s,%s): %s", chat_id, user_id, exc)
+
     # ------------------------------------------------------------------ per-user queue
 
     def submit(self, msg: Incoming) -> None:
         key = (msg.chat_id, msg.user_id)
-        chan = self.channels.get(key)
-        if chan is None:
-            chan = self.channels[key] = Channel()
+        chan = self._get_channel(msg.chat_id, msg.user_id)
         chan.pending.append(msg)
         if chan.abort is not None:
             chan.abort.set()  # interrupt the in-flight generation -> it re-batches + merges
@@ -354,6 +511,8 @@ class TelegramBot:
                 continue
 
             await self._ensure_loaded(chan, chat_id, user_id)
+            model = chan.model or self.default_model
+            thinking = chan.thinking if chan.thinking is not None else self.settings.tg_enable_thinking
 
             # Arm the interrupt BEFORE any await, so a message arriving during the
             # acknowledgement round-trips still aborts this generation (no lost merge).
@@ -370,7 +529,9 @@ class TelegramBot:
             typing_stop = asyncio.Event()
             typing = asyncio.create_task(self._typing_loop(chat_id, typing_stop))
             try:
-                text, reasoning, interrupted, error = await self._generate(messages, abort)
+                text, reasoning, interrupted, error = await self._generate(
+                    messages, abort, model, thinking
+                )
             finally:
                 typing_stop.set()
                 await asyncio.gather(typing, return_exceptions=True)
@@ -414,17 +575,32 @@ class TelegramBot:
             del chan.history[: len(chan.history) - cap]
 
     async def _ensure_loaded(self, chan: Channel, chat_id: int, user_id: int) -> None:
-        """Hydrate a channel's history from SQLite once, on first use after (re)start."""
+        """Hydrate a channel's history + prefs from SQLite once, on first use after (re)start.
+
+        Guarded by a per-channel lock so a command handler and the worker can't both load
+        concurrently (which could skip with stale-empty data or clobber an appended turn).
+        """
         if self._store is None or chan.loaded:
             return
-        chan.loaded = True
-        try:
-            cap = max(0, self.settings.tg_history_turns) * 2
-            chan.history = await asyncio.to_thread(self._store.load, chat_id, user_id, cap)
-            if chan.history:
-                logger.info("restored %d history msgs for (%s,%s)", len(chan.history), chat_id, user_id)
-        except Exception as exc:
-            logger.warning("history load failed for (%s,%s): %s", chat_id, user_id, exc)
+        async with chan.load_lock:
+            if chan.loaded:
+                return
+            try:
+                cap = max(0, self.settings.tg_history_turns) * 2
+                chan.history = await asyncio.to_thread(self._store.load, chat_id, user_id, cap)
+                model, thinking = await asyncio.to_thread(self._store.get_prefs, chat_id, user_id)
+                if model and model in self.settings.models:
+                    chan.model = model
+                if thinking is not None:
+                    chan.thinking = thinking
+                if chan.history:
+                    logger.info(
+                        "restored %d history msgs for (%s,%s)", len(chan.history), chat_id, user_id
+                    )
+            except Exception as exc:
+                logger.warning("history load failed for (%s,%s): %s", chat_id, user_id, exc)
+            finally:
+                chan.loaded = True
 
     async def _persist(self, chat_id: int, user_id: int, turn: list[dict]) -> None:
         if self._store is None:
@@ -437,14 +613,14 @@ class TelegramBot:
 
     # ------------------------------------------------------------------ generation
 
-    def _prompt_budget(self) -> int:
+    def _prompt_budget(self, model: str) -> int:
         """Max prompt tokens = model context window − reserved output − a small margin."""
-        spec = self.settings.models.get(self.model)
+        spec = self.settings.models.get(model)
         context = spec.context if spec else 8192
         reserve = min(self.settings.tg_max_tokens, max(256, context // 2))
         return max(1024, context - reserve - PROMPT_MARGIN)
 
-    async def _generate(self, messages: list[dict], abort: threading.Event):
+    async def _generate(self, messages: list[dict], abort: threading.Event, model: str, enable_thinking: bool):
         """Run the blocking model stream in a thread, bridging events over a queue.
 
         Mirrors the server's `_stream_completion`. ``abort`` is NOT passed to the manager;
@@ -454,17 +630,16 @@ class TelegramBot:
         """
         queue: asyncio.Queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
-        model = self.model
         params = {
             "max_tokens": self.settings.tg_max_tokens,
             "temperature": 0.7,
             "top_p": 0.95,
-            "enable_thinking": self.settings.tg_enable_thinking,
+            "enable_thinking": enable_thinking,
             # Bot KV is quantized harder than the API (default 4-bit vs 8): chats are frequent
             # and short, so the smaller cache trims memory/bandwidth at a tiny quality cost.
             "kv_bits": self.settings.tg_kv_bits,
             # Trim oldest history so prompt + reserved output fit the model's context window.
-            "max_prompt_tokens": self._prompt_budget(),
+            "max_prompt_tokens": self._prompt_budget(model),
         }
 
         def produce() -> None:
@@ -510,7 +685,9 @@ class TelegramBot:
 
     def _compose_markdown(self, text: str, reasoning: str) -> str:
         text = (text or "").strip()
-        if self.settings.tg_enable_thinking and reasoning and reasoning.strip():
+        # Show reasoning whenever the model produced it (i.e. the user has thinking on);
+        # telegramify collapses long quotes into an expandable blockquote.
+        if reasoning and reasoning.strip():
             quoted = "\n".join("> " + ln for ln in reasoning.strip().splitlines())
             return f"{quoted}\n\n{text}" if text else quoted
         return text

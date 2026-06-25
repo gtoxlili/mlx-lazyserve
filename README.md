@@ -78,12 +78,12 @@ This is already set in the LaunchAgent plist, so the running service downloads m
 | `MLX_LAZYSERVE_MODELS` | `./models.toml` | path to the model registry |
 | `MLX_LAZYSERVE_PAUSE_FILE` | `./.maintenance` | maintenance-marker path (present = start paused) |
 | `MLX_LAZYSERVE_TG_BOT_TOKEN` | *(empty)* | BotFather token; empty = Telegram bot off (see [Telegram bot](#telegram-bot)) |
-| `MLX_LAZYSERVE_TG_MODEL` | *(default model)* | model the bot chats with |
+| `MLX_LAZYSERVE_TG_MODEL` | *(default model)* | **default** model the bot chats with (each user overrides via `/model`) |
 | `MLX_LAZYSERVE_TG_SYSTEM_PROMPT` | *(built-in)* | system persona for the bot |
 | `MLX_LAZYSERVE_TG_MAX_TOKENS` | `MAX_TOKENS` | max output tokens per bot reply |
 | `MLX_LAZYSERVE_TG_KV_BITS` | `4` | bot KV-cache quant bits (4 = fast/light, 8 = higher quality, 0 = off) |
 | `MLX_LAZYSERVE_TG_HISTORY_TURNS` | `8` | per-(group,user) turns kept as context |
-| `MLX_LAZYSERVE_TG_ENABLE_THINKING` | `false` | show the bot's reasoning as an expandable blockquote |
+| `MLX_LAZYSERVE_TG_ENABLE_THINKING` | `false` | **default** for reasoning (each user overrides via `/think`); shown as an expandable blockquote |
 | `MLX_LAZYSERVE_TG_DB_PATH` | `./telegram-history.db` | SQLite file for per-(group,user) history (persists across restarts) |
 
 ## API
@@ -183,6 +183,11 @@ replies-to-the-bot, and commands — exactly the bot's triggers — so it never 
   **expandable blockquotes**, over-long answers auto-split, and big code blocks become file
   attachments. While working, the bot sets a 👀 reaction + the "typing…" action and threads its
   reply onto your message.
+- **Per-user model & thinking**: each user picks their own model with **`/model`** and toggles
+  reasoning with **`/think`** — inline-keyboard buttons, or `/model <name>` / `/think on|off`.
+  Choices persist per (group, user). `MLX_LAZYSERVE_TG_MODEL` / `MLX_LAZYSERVE_TG_ENABLE_THINKING`
+  are just the defaults. (Switching models evicts + loads on the single GPU slot, so the first
+  message after a switch is slower.)
 - **Per-user memory**: a short rolling history per (group, user), persisted to **SQLite** so it
   survives restarts; `/reset` clears yours. History is kept to the last
   `MLX_LAZYSERVE_TG_HISTORY_TURNS` turns, and the prompt is additionally trimmed (oldest first,
@@ -194,9 +199,12 @@ replies-to-the-bot, and commands — exactly the bot's triggers — so it never 
   native chat turns) — one coherent reply, not two.
 - **No streaming**: replies are sent whole.
 
-Tune it with the `MLX_LAZYSERVE_TG_*` env vars (table above). By default the bot uses the fast
-`qwen3.5-9b` model with a **4-bit KV cache** for snappy chat replies (the OpenAI API path keeps
-its own `MLX_LAZYSERVE_KV_BITS`).
+Commands: **`/model`** (choose your model), **`/think`** (toggle your reasoning), **`/reset`**
+(clear your context). The bot self-registers these on startup.
+
+Tune defaults with the `MLX_LAZYSERVE_TG_*` env vars (table above). By default the bot uses the
+fast `qwen3.5-9b` model with a **4-bit KV cache** for snappy chat replies (the OpenAI API path
+keeps its own `MLX_LAZYSERVE_KV_BITS`).
 
 ## Run as a service (24/7)
 
