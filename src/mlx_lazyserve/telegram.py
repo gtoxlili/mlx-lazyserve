@@ -7,8 +7,10 @@ is set, and the extra deps (``httpx`` + ``telegramify-markdown``, the ``telegram
 imported lazily so the core install stays lean.
 
 Behavior:
-- **Groups only.** Triggers when a message @mentions the bot or replies to one of the bot's
-  messages. DMs, other bots, and the bot's own messages are ignored.
+- **Groups + gated DMs.** In groups it triggers on @mentions or replies to it. Private chats
+  are open but gated: a stranger's first DM asks an owner (``MLX_LAZYSERVE_TG_OWNER_IDS``) to
+  approve via inline buttons; approved user ids are remembered in SQLite. Other bots and the
+  bot's own messages are ignored.
 - **Per-(chat, user) memory + prefs.** A short bounded conversation history per user, plus each
   user's own model (``/model``) and thinking toggle (``/think``) — all persisted to SQLite.
 - **Interrupt + merge.** If a user sends a new message while the bot is still generating
@@ -94,6 +96,9 @@ class HistoryStore:
             "chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, "
             "model TEXT, thinking INTEGER, PRIMARY KEY(chat_id, user_id))"
         )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS dm_allowed(user_id INTEGER PRIMARY KEY)"
+        )
         self._conn.commit()
 
     def load(self, chat_id: int, user_id: int, limit: int) -> list[dict]:
@@ -155,6 +160,15 @@ class HistoryStore:
             )
             self._conn.commit()
 
+    def all_dm_allowed(self) -> list[int]:
+        with self._lock:
+            return [r[0] for r in self._conn.execute("SELECT user_id FROM dm_allowed").fetchall()]
+
+    def allow_dm(self, user_id: int) -> None:
+        with self._lock:
+            self._conn.execute("INSERT OR IGNORE INTO dm_allowed(user_id) VALUES(?)", (user_id,))
+            self._conn.commit()
+
 
 class TelegramBot:
     def __init__(self, settings: Settings, manager: ModelManager) -> None:
@@ -169,6 +183,9 @@ class TelegramBot:
         self._closing = False  # set on shutdown: abort generations + stop workers
         self._bg: set[asyncio.Task] = set()  # strong refs so fire-and-forget tasks aren't GC'd
         self._store: HistoryStore | None = None  # SQLite history, opened in run()
+        self._dm_allowed: set[int] = set()  # user ids approved for private chat (mirrors DB)
+        self._dm_pending: set[int] = set()  # DM auth requests awaiting an owner decision
+        self._dm_denied: set[int] = set()  # DM users an owner rejected (silently ignored)
 
     def _spawn(self, coro) -> None:
         task = asyncio.create_task(coro)
@@ -194,11 +211,19 @@ class TelegramBot:
             )
             return
 
+        # httpx logs one INFO line per request — noisy, and it prints the bot token in the URL.
+        # Quiet it to WARNING so the service log stays useful (and tokenless) for debugging.
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+
         self._setup_markdown()
         if self.settings.tg_db_path:
             try:
                 self._store = HistoryStore(str(self.settings.tg_db_path))
-                logger.info("Telegram history persisted to %s", self.settings.tg_db_path)
+                self._dm_allowed = set(self._store.all_dm_allowed())
+                logger.info(
+                    "Telegram history persisted to %s (%d DM-approved users)",
+                    self.settings.tg_db_path, len(self._dm_allowed),
+                )
             except Exception as exc:
                 logger.warning("could not open history DB (%s); using in-memory history", exc)
                 self._store = None
@@ -298,12 +323,16 @@ class TelegramBot:
         if not message:
             return
         chat = message.get("chat") or {}
-        if chat.get("type") not in ("group", "supergroup"):
-            return  # groups only
-        chat_id = chat.get("id")
+        ctype = chat.get("type")
         frm = message.get("from") or {}
         if frm.get("is_bot") or frm.get("id") is None:
             return
+        if ctype == "private":
+            self._handle_private(message, chat.get("id"), frm)
+            return
+        if ctype not in ("group", "supergroup"):
+            return
+        chat_id = chat.get("id")
 
         text = (message.get("text") or message.get("caption") or "").strip()
         cmd, arg = self._parse_command(text)
@@ -321,6 +350,67 @@ class TelegramBot:
         req = self._extract_request(message, chat_id, frm["id"], text)
         if req is not None:
             self.submit(req)
+
+    def _handle_private(self, message: dict, chat_id: int, frm: dict) -> None:
+        """Private chat: gated by owner approval; approved users (and owners) chat normally."""
+        user_id = frm["id"]
+        mid = message.get("message_id")
+        text = (message.get("text") or message.get("caption") or "").strip()
+        if not self._dm_authorized(user_id):
+            if user_id not in self._dm_denied:
+                self._spawn(self._request_dm_auth(user_id, chat_id, frm))
+            return
+        cmd, arg = self._parse_command(text)
+        if cmd is not None:
+            if cmd == "reset":
+                self._reset(chat_id, user_id)
+                self._spawn(self._send_plain(chat_id, "🧹 已清空我们的对话上下文。", mid))
+            elif cmd == "model":
+                self._spawn(self._cmd_model(chat_id, user_id, mid, arg))
+            elif cmd in ("think", "thinking"):
+                self._spawn(self._cmd_think(chat_id, user_id, mid, arg))
+            elif cmd in ("start", "help"):
+                self._spawn(self._send_plain(
+                    chat_id,
+                    "你好,直接发消息就行。命令:/model 选模型 · /think 开关思考 · /reset 清空上下文",
+                    mid,
+                ))
+            return
+        if text:
+            self.submit(Incoming(chat_id, user_id, mid, text))
+
+    def _dm_authorized(self, user_id: int) -> bool:
+        if not self.settings.tg_owner_ids:
+            return True  # no owner configured -> private chat is open to everyone
+        return user_id in self.settings.tg_owner_ids or user_id in self._dm_allowed
+
+    async def _request_dm_auth(self, user_id: int, chat_id: int, frm: dict) -> None:
+        """Tell the stranger we're asking, and DM each owner an approve/deny prompt."""
+        if user_id in self._dm_pending or not self.settings.tg_owner_ids:
+            return  # already outstanding, or nobody to ask
+        self._dm_pending.add(user_id)
+        await self._send_plain(
+            chat_id, "👋 你好。我需要管理员授权后才能回复——已发送授权请求,通过后即可对话。"
+        )
+        name = ((frm.get("first_name") or "") + " " + (frm.get("last_name") or "")).strip()
+        uname = frm.get("username")
+        who = f"{name} (@{uname})" if uname else (name or "(无用户名)")
+        kb = {"inline_keyboard": [[
+            {"text": "✅ 允许", "callback_data": f"auth:ok:{user_id}"},
+            {"text": "❌ 拒绝", "callback_data": f"auth:no:{user_id}"},
+        ]]}
+        notice = f"🔔 私聊授权请求\n用户:{who}\nID: {user_id}\n是否允许 ta 私聊机器人?"
+        sent = False
+        for owner in self.settings.tg_owner_ids:
+            if await self._api_quiet(
+                "sendMessage", chat_id=owner, text=notice, reply_markup=kb,
+                link_preview_options={"is_disabled": True},
+            ) is not None:
+                sent = True
+        if not sent:
+            # owner unreachable (hasn't started the bot?) — drop pending so a later retry works
+            self._dm_pending.discard(user_id)
+            logger.warning("could not deliver DM-auth request for %s (owner not reachable)", user_id)
 
     async def _handle_my_chat_member(self, upd: dict) -> None:
         """Owner gate: leave any group we're added to by a non-owner (if an allowlist is set)."""
@@ -452,13 +542,17 @@ class TelegramBot:
         )
 
     async def _handle_callback(self, cb: dict) -> None:
-        """Apply an inline-keyboard tap to the *tapper's* prefs; confirm via a private toast."""
+        """Inline-keyboard tap: prefs go to the tapper; auth taps to owners only."""
         cb_id = cb.get("id")
         data = cb.get("data") or ""
-        chat_id = ((cb.get("message") or {}).get("chat") or {}).get("id")
+        msg = cb.get("message") or {}
+        chat_id = (msg.get("chat") or {}).get("id")
         user_id = (cb.get("from") or {}).get("id")
         if chat_id is None or user_id is None:
             await self._api_quiet("answerCallbackQuery", callback_query_id=cb_id)
+            return
+        if data.startswith("auth:"):
+            await self._handle_auth_callback(cb_id, data, user_id, msg)
             return
         chan = self._get_channel(chat_id, user_id)
         await self._ensure_loaded(chan, chat_id, user_id)
@@ -501,6 +595,46 @@ class TelegramBot:
                 await asyncio.to_thread(self._store.set_thinking, chat_id, user_id, thinking)
         except Exception as exc:
             logger.warning("save pref failed for (%s,%s): %s", chat_id, user_id, exc)
+
+    async def _handle_auth_callback(self, cb_id, data: str, actor_id: int, msg: dict) -> None:
+        """An owner approving/denying a stranger's private-chat request."""
+        if actor_id not in self.settings.tg_owner_ids:
+            await self._api_quiet("answerCallbackQuery", callback_query_id=cb_id, text="无权操作")
+            return
+        try:
+            _, action, target = data.split(":", 2)
+            target_id = int(target)
+        except (ValueError, TypeError):
+            await self._api_quiet("answerCallbackQuery", callback_query_id=cb_id)
+            return
+        self._dm_pending.discard(target_id)
+        if action == "ok":
+            self._dm_allowed.add(target_id)
+            self._dm_denied.discard(target_id)
+            await self._save_dm_allowed(target_id)
+            await self._api_quiet("answerCallbackQuery", callback_query_id=cb_id, text=f"✅ 已允许 {target_id}")
+            await self._api_quiet(
+                "sendMessage", chat_id=target_id,
+                text="✅ 管理员已通过,现在可以直接发消息和我聊天了。",
+                link_preview_options={"is_disabled": True},
+            )
+            result = f"✅ 已允许 {target_id} 私聊"
+        else:
+            self._dm_denied.add(target_id)
+            await self._api_quiet("answerCallbackQuery", callback_query_id=cb_id, text=f"已拒绝 {target_id}")
+            result = f"❌ 已拒绝 {target_id}"
+        if msg.get("message_id") and (msg.get("chat") or {}).get("id") is not None:
+            await self._api_quiet(
+                "editMessageText", chat_id=msg["chat"]["id"], message_id=msg["message_id"], text=result
+            )
+
+    async def _save_dm_allowed(self, user_id: int) -> None:
+        if self._store is None:
+            return
+        try:
+            await asyncio.to_thread(self._store.allow_dm, user_id)
+        except Exception as exc:
+            logger.warning("persist dm-allow failed for %s: %s", user_id, exc)
 
     # ------------------------------------------------------------------ per-user queue
 

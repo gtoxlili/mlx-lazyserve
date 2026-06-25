@@ -85,7 +85,7 @@ This is already set in the LaunchAgent plist, so the running service downloads m
 | `MLX_LAZYSERVE_TG_HISTORY_TURNS` | `8` | per-(group,user) turns kept as context |
 | `MLX_LAZYSERVE_TG_ENABLE_THINKING` | `false` | **default** for reasoning (each user overrides via `/think`); shown as an expandable blockquote |
 | `MLX_LAZYSERVE_TG_DB_PATH` | `./telegram-history.db` | SQLite file for per-(group,user) history (persists across restarts) |
-| `MLX_LAZYSERVE_TG_OWNER_IDS` | *(empty)* | comma-separated user ids allowed to add the bot to a group; anyone else → it auto-leaves (empty = no restriction) |
+| `MLX_LAZYSERVE_TG_OWNER_IDS` | *(empty)* | owner user ids: only they may add the bot to a group (others → it leaves) and they approve stranger DMs; empty = no restriction. See [Access control](#access-control) |
 
 ## API
 
@@ -158,10 +158,11 @@ Standard OpenAI knobs are honored: `temperature`, `top_p`, `top_k`, `min_p`, `se
 
 ## Telegram bot
 
-An optional Telegram bot is **embedded in the same process** — no second service. Add it to a
-group and it replies to any message that **@mentions it** or **replies to one of its messages**
-(it ignores unrelated chatter, other bots, and DMs). It calls the in-process model directly, so
-it shares the single model slot with the OpenAI API.
+An optional Telegram bot is **embedded in the same process** — no second service. In groups it
+replies to any message that **@mentions it** or **replies to one of its messages** (ignoring
+unrelated chatter and other bots). **Private chats** work too, but are gated: a stranger's first
+DM asks an owner to approve before the bot will reply (see [Access control](#access-control)). It
+calls the in-process model directly, so it shares the single model slot with the OpenAI API.
 
 ### Setup
 
@@ -199,9 +200,20 @@ replies-to-the-bot, and commands — exactly the bot's triggers — so it never 
   it drops the half-finished generation and re-runs over **both** messages (passed as separate
   native chat turns) — one coherent reply, not two.
 - **No streaming**: replies are sent whole.
-- **Add-gating**: set `MLX_LAZYSERVE_TG_OWNER_IDS` to the user ids allowed to add the bot to a
-  group — if anyone else adds it, it posts a short notice and **leaves immediately** (empty =
-  anyone can add). It only ever responds in groups; DMs are ignored.
+
+### Access control
+
+`MLX_LAZYSERVE_TG_OWNER_IDS` (comma-separated user ids) are the bot's owners. They gate two things:
+
+- **Group add**: only an owner may add the bot to a group; if anyone else adds it, it posts a
+  short notice and **leaves immediately**.
+- **Private chat**: DMs are open but gated — a **stranger's first DM** triggers an approve/deny
+  prompt sent to the owner(s); the bot only replies once approved, and the approved user id is
+  **saved to SQLite** (so they stay approved across restarts). Owners are always allowed.
+
+Empty `MLX_LAZYSERVE_TG_OWNER_IDS` = no restrictions (anyone can add it / DM it). **Note:** for
+the approval DM to reach an owner, that owner must have started a chat with the bot at least once
+(Telegram forbids bots from messaging users first).
 
 Commands: **`/model`** (choose your model), **`/think`** (toggle your reasoning), **`/reset`**
 (clear your context). The bot self-registers these on startup.
