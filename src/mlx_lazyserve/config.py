@@ -108,6 +108,12 @@ def _int_env(name: str, default: int) -> int:
     return int(raw)
 
 
+def _str_env(name: str, default: str) -> str:
+    # Empty/whitespace counts as "use default" too — the plist always injects the key as "".
+    raw = os.environ.get(name)
+    return raw if (raw and raw.strip()) else default
+
+
 def load_settings() -> Settings:
     models, default_model = _load_models()
     api_keys = tuple(
@@ -143,9 +149,7 @@ def load_settings() -> Settings:
         ).expanduser(),
         tg_bot_token=os.environ.get("MLX_LAZYSERVE_TG_BOT_TOKEN", "").strip(),
         tg_model=(os.environ.get("MLX_LAZYSERVE_TG_MODEL", "").strip() or None),
-        tg_system_prompt=os.environ.get(
-            "MLX_LAZYSERVE_TG_SYSTEM_PROMPT", _DEFAULT_TG_SYSTEM_PROMPT
-        ),
+        tg_system_prompt=_str_env("MLX_LAZYSERVE_TG_SYSTEM_PROMPT", _DEFAULT_TG_SYSTEM_PROMPT),
         tg_max_tokens=_int_env(
             "MLX_LAZYSERVE_TG_MAX_TOKENS",
             _int_env("MLX_LAZYSERVE_MAX_TOKENS", 8192),
