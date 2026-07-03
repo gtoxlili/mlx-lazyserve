@@ -3,6 +3,8 @@ name = "mlx-lazyserve"
 version = "0.1.0"
 description = "Ollama-style, lazy-loading MLX inference server (OpenAI-compatible) for Apple Silicon"
 readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 authors = [
     { name = "gtoxlili", email = "gtoxlili@outlook.com" }
 ]
