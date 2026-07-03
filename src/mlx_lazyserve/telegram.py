@@ -841,13 +841,20 @@ class TelegramBot:
             "tools": tools,
         }
 
+        # A generation stops on a real interrupt (`abort`, set by submit() on a new message) OR
+        # on our own post-run cleanup (`producer_stop`). Keeping cleanup on a *separate* event is
+        # essential: `abort` is shared across the tool-call rounds in `_agentic_generate`, so
+        # setting it here (as this finally used to) would falsely "interrupt" the next round and
+        # spin the worker forever — re-batching and hitting the web tool after every round.
+        producer_stop = threading.Event()
+
         def produce() -> None:
             interrupted = False
             try:
                 gen = self.manager.generate_stream(model, messages, **params)
                 for event in gen:
-                    if abort.is_set():
-                        interrupted = True
+                    if abort.is_set() or producer_stop.is_set():
+                        interrupted = abort.is_set()  # only a real interrupt counts as one
                         gen.close()  # its finally closes the mlx stream + releases the lock
                         break
                     loop.call_soon_threadsafe(queue.put_nowait, ("event", event))
@@ -879,7 +886,7 @@ class TelegramBot:
                     tool_calls.extend(value["tool_calls"])
                 # usage is not surfaced in the chat bot
         finally:
-            abort.set()
+            producer_stop.set()  # stop the producer WITHOUT poisoning the shared `abort`
             await asyncio.gather(producer, return_exceptions=True)
         return "".join(content), "".join(reasoning), tool_calls, interrupted, error
 
@@ -912,6 +919,10 @@ class TelegramBot:
             )
             if interrupted or error or not tool_calls:
                 break
+            logger.info(
+                "web tools round %d/%d: %s", step + 1, self.settings.tg_web_max_iters,
+                ", ".join((tc.get("function") or {}).get("name") or "?" for tc in tool_calls),
+            )
             if status_mid is None:  # first tool round → show a transient "browsing" note
                 status_mid = await self._web_status(chat_id, tool_calls)
             # Keep the model's own tool-call turn in context, then append each tool result.
