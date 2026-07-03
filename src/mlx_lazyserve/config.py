@@ -48,6 +48,13 @@ class Settings:
     tg_enable_thinking: bool  # if true, render reasoning as an expandable blockquote
     tg_db_path: Path  # SQLite file persisting per-(chat,user) conversation history
     tg_owner_ids: tuple[int, ...]  # user ids allowed to add the bot to a group; empty = anyone
+    # Web tools (Firecrawl) for the bot: let the model search the web + read pages/PDFs.
+    tg_web_tools: bool  # advertise web_search/web_scrape to the model (needs tool-capable model)
+    firecrawl_api_key: str  # optional; "" = Firecrawl keyless free tier (rate-limited per IP)
+    firecrawl_base_url: str  # Firecrawl API base (override for a self-hosted instance)
+    tg_web_max_iters: int  # max model<->tool round-trips before the model must answer
+    tg_web_result_chars: int  # cap per tool result fed back to the model (context hygiene)
+    tg_web_search_limit: int  # default web_search result count
 
 
 def _registry_path() -> Path:
@@ -185,4 +192,12 @@ def load_settings() -> Settings:
             in ("1", "true", "yes", "on"),
         ),
         tg_owner_ids=tg_owner_ids,
+        tg_web_tools=_bool_env("MLX_LAZYSERVE_TG_WEB_TOOLS", True),
+        firecrawl_api_key=os.environ.get("MLX_LAZYSERVE_FIRECRAWL_API_KEY", "").strip(),
+        firecrawl_base_url=_str_env(
+            "MLX_LAZYSERVE_FIRECRAWL_BASE_URL", "https://api.firecrawl.dev"
+        ),
+        tg_web_max_iters=_int_env("MLX_LAZYSERVE_TG_WEB_MAX_ITERS", 3),
+        tg_web_result_chars=_int_env("MLX_LAZYSERVE_TG_WEB_RESULT_CHARS", 6000),
+        tg_web_search_limit=_int_env("MLX_LAZYSERVE_TG_WEB_SEARCH_LIMIT", 5),
     )

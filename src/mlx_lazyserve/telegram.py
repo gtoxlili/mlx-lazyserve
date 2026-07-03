@@ -16,6 +16,9 @@ Behavior:
 - **Interrupt + merge.** If a user sends a new message while the bot is still generating
   *that user's* reply, the in-flight generation is aborted and a fresh one runs over the
   **merged** messages — so the user gets one coherent answer, not two.
+- **Web tools (optional).** When enabled, the model can call ``web_search`` / ``web_scrape``
+  (Firecrawl, keyless) mid-reply to look things up; results are fed back and it answers from
+  them. Tool rounds are ephemeral — kept out of the saved history (see :mod:`.firecrawl`).
 - **No streaming.** The whole reply is generated, then sent (auto-split, rich-formatted).
 
 Rendering uses recent Bot API formatting features: telegramify-markdown -> message
@@ -35,6 +38,7 @@ from dataclasses import dataclass, field
 
 from .config import Settings
 from .engine import trim_degenerate
+from .firecrawl import TOOL_SCHEMAS, FirecrawlClient
 from .manager import ModelManager
 
 logger = logging.getLogger("mlx_lazyserve.telegram")
@@ -184,6 +188,7 @@ class TelegramBot:
         self._closing = False  # set on shutdown: abort generations + stop workers
         self._bg: set[asyncio.Task] = set()  # strong refs so fire-and-forget tasks aren't GC'd
         self._store: HistoryStore | None = None  # SQLite history, opened in run()
+        self._fc: FirecrawlClient | None = None  # Firecrawl web-tools client (opened in run())
         self._dm_allowed: set[int] = set()  # user ids approved for private chat (mirrors DB)
         self._dm_pending: set[int] = set()  # DM auth requests awaiting an owner decision
         self._dm_denied: set[int] = set()  # DM users an owner rejected (silently ignored)
@@ -242,6 +247,22 @@ class TelegramBot:
                 "Telegram bot @%s (id=%s) online; default model=%s",
                 self.username, self.bot_id, self.default_model,
             )
+            if self.settings.tg_web_tools:
+                try:
+                    self._fc = FirecrawlClient(
+                        base_url=self.settings.firecrawl_base_url,
+                        api_key=self.settings.firecrawl_api_key,
+                        result_chars=self.settings.tg_web_result_chars,
+                        search_limit=self.settings.tg_web_search_limit,
+                    )
+                    logger.info(
+                        "Telegram web tools ON (Firecrawl %s, %s)",
+                        self.settings.firecrawl_base_url,
+                        "keyed" if self.settings.firecrawl_api_key else "keyless",
+                    )
+                except Exception as exc:
+                    logger.warning("Firecrawl init failed (%s); web tools disabled", exc)
+                    self._fc = None
             # Drop any backlog so a restart doesn't replay stale @mentions.
             await self._api_quiet("deleteWebhook", drop_pending_updates=True)
             await self._api_quiet(
@@ -258,6 +279,8 @@ class TelegramBot:
                 # On stop/cancel, abort in-flight generations (sync, safe under cancellation)
                 # so they release the model lock promptly and manager.shutdown() doesn't block.
                 self._abort_all()
+                if self._fc is not None:
+                    await self._fc.aclose()
         logger.info("Telegram bot stopped")
 
     def _abort_all(self) -> None:
@@ -684,12 +707,12 @@ class TelegramBot:
             await self._react(chat_id, reply_to, ACK_REACTION)
             reacted = reply_to
 
-            messages = self._build_messages(chan.history, batch_msgs)
+            convo = self._build_messages(chan.history, batch_msgs)
             typing_stop = asyncio.Event()
             typing = asyncio.create_task(self._typing_loop(chat_id, typing_stop))
             try:
-                text, reasoning, interrupted, error = await self._generate(
-                    messages, abort, model, thinking
+                text, reasoning, interrupted, error = await self._agentic_generate(
+                    chat_id, convo, abort, model, thinking
                 )
             finally:
                 typing_stop.set()
@@ -785,13 +808,16 @@ class TelegramBot:
         reserve = min(self.settings.tg_max_tokens, max(256, context // 2))
         return max(1024, context - reserve - PROMPT_MARGIN)
 
-    async def _generate(self, messages: list[dict], abort: threading.Event, model: str, enable_thinking: bool):
+    async def _generate(
+        self, messages: list[dict], abort: threading.Event, model: str,
+        enable_thinking: bool, tools: list | None = None,
+    ):
         """Run the blocking model stream in a thread, bridging events over a queue.
 
         Mirrors the server's `_stream_completion`. ``abort`` is NOT passed to the manager;
         the producer checks it itself and reports ``interrupted`` at the moment it breaks —
         so a message arriving just after a *natural* finish never discards a completed reply.
-        Returns ``(content, reasoning, interrupted, error)``.
+        Returns ``(content, reasoning, tool_calls, interrupted, error)``.
         """
         queue: asyncio.Queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
@@ -811,6 +837,8 @@ class TelegramBot:
             "loop_guard": self.settings.loop_guard,
             # Trim oldest history so prompt + reserved output fit the model's context window.
             "max_prompt_tokens": self._prompt_budget(model),
+            # OpenAI-style tool schemas (web search/scrape); None = no tools offered this turn.
+            "tools": tools,
         }
 
         def produce() -> None:
@@ -831,6 +859,7 @@ class TelegramBot:
         producer = asyncio.create_task(asyncio.to_thread(produce))
         content: list[str] = []
         reasoning: list[str] = []
+        tool_calls: list = []
         error: str | None = None
         interrupted = False
         try:
@@ -846,11 +875,82 @@ class TelegramBot:
                     content.append(value["content"])
                 elif value.get("reasoning"):
                     reasoning.append(value["reasoning"])
-                # tool_calls / usage are not surfaced in the chat bot
+                elif value.get("tool_calls"):
+                    tool_calls.extend(value["tool_calls"])
+                # usage is not surfaced in the chat bot
         finally:
             abort.set()
             await asyncio.gather(producer, return_exceptions=True)
-        return "".join(content), "".join(reasoning), interrupted, error
+        return "".join(content), "".join(reasoning), tool_calls, interrupted, error
+
+    # ------------------------------------------------------------------ web tools (agentic)
+
+    def _web_tools(self) -> list | None:
+        """Tool schemas advertised to the model this turn, or None when web tools are off."""
+        return TOOL_SCHEMAS if self._fc is not None else None
+
+    async def _agentic_generate(self, chat_id, convo: list[dict], abort, model, thinking):
+        """Generate a reply, letting the model call web tools (Firecrawl) and feeding results back.
+
+        Loops model → tool → model until the model answers without a tool call or the round cap
+        (`tg_web_max_iters`) is hit; the final pass is offered no tools, forcing a text answer so
+        the loop always terminates. Tool rounds are **ephemeral** — only the user turns + final
+        answer are persisted by the caller, so a scraped page never poisons the saved history.
+        A newer message mid-loop aborts the in-flight generation (interrupted=True) and the
+        caller re-batches, exactly as in the no-tools path. Returns the same
+        ``(text, reasoning, interrupted, error)`` shape the worker already expects.
+        """
+        tools = self._web_tools()
+        status_mid: int | None = None
+        text = reasoning = ""
+        interrupted = False
+        error: str | None = None
+        for step in range(self.settings.tg_web_max_iters + 1):
+            offer = tools if (tools and step < self.settings.tg_web_max_iters) else None
+            text, reasoning, tool_calls, interrupted, error = await self._generate(
+                convo, abort, model, thinking, tools=offer
+            )
+            if interrupted or error or not tool_calls:
+                break
+            if status_mid is None:  # first tool round → show a transient "browsing" note
+                status_mid = await self._web_status(chat_id, tool_calls)
+            # Keep the model's own tool-call turn in context, then append each tool result.
+            convo.append({"role": "assistant", "content": text or "", "tool_calls": tool_calls})
+            await self._run_tools(convo, tool_calls)
+        if status_mid is not None:
+            await self._api_quiet("deleteMessage", chat_id=chat_id, message_id=status_mid)
+        return text, reasoning, interrupted, error
+
+    async def _run_tools(self, convo: list[dict], tool_calls: list) -> None:
+        """Execute each tool call against Firecrawl (concurrently) and append a ``tool`` message."""
+        async def run_one(tc: dict) -> dict:
+            fn = tc.get("function") or {}
+            name = fn.get("name") or ""
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+                if not isinstance(args, dict):
+                    args = {}
+            except (ValueError, TypeError):
+                args = {}
+            result = await self._fc.dispatch(name, args)
+            return {"role": "tool", "tool_call_id": tc.get("id"), "name": name, "content": result}
+
+        convo.extend(await asyncio.gather(*(run_one(tc) for tc in tool_calls)))
+
+    async def _web_status(self, chat_id, tool_calls: list) -> int | None:
+        """Post a transient 'browsing the web' note; its id is returned so we can delete it."""
+        names = {(tc.get("function") or {}).get("name") for tc in tool_calls}
+        if "web_search" in names:
+            text = "🔍 正在联网搜索…"
+        elif "web_scrape" in names:
+            text = "🌐 正在读取网页…"
+        else:
+            text = "🌐 正在联网…"
+        sent = await self._api_quiet(
+            "sendMessage", chat_id=chat_id, text=text,
+            link_preview_options={"is_disabled": True},
+        )
+        return sent.get("message_id") if sent else None
 
     # ------------------------------------------------------------------ sending
 

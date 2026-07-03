@@ -12,7 +12,7 @@ Why MLX instead of Ollama: on Apple Silicon MLX decodes MoE models noticeably fa
 - Lazy load on first use, idle unload; one model resident at a time (sized for 24 GB)
 - Text and vision-language models (tries `mlx-lm`, falls back to `mlx-vlm`)
 - Optional bearer-token auth, a `launchd` service for 24/7, and a maintenance mode
-- Optional embedded Telegram bot
+- Optional embedded Telegram bot (with web search + page/PDF reading via Firecrawl)
 
 ## Models
 
@@ -91,7 +91,7 @@ Without the rule the service still runs on the default cap (it just logs a warni
 
 - **Reverse proxy**: [`deploy/nginx/mlx-lazyserve.conf`](deploy/nginx/mlx-lazyserve.conf) is an SSE-friendly nginx vhost (Cloudflare → nginx → Tailscale). Edit `server_name` and the upstream host for your setup.
 - **Maintenance mode**: `POST /admin/maintenance {"enabled":true}` unloads the model and returns 503 for inference, for when a scheduled job needs the GPU/RAM back; `{"enabled":false}` resumes.
-- **Telegram bot**: set `MLX_LAZYSERVE_TG_BOT_TOKEN` (from [@BotFather](https://t.me/BotFather)) and `uv sync --extra telegram`. It answers @mentions and replies in groups, keeps a short per-user history in SQLite, and lets each user pick a model (`/model`) and toggle reasoning (`/think`). `MLX_LAZYSERVE_TG_OWNER_IDS` gates who can add it to a group or DM it. All `TG_*` options are in [`service.env.example`](deploy/service.env.example).
+- **Telegram bot**: set `MLX_LAZYSERVE_TG_BOT_TOKEN` (from [@BotFather](https://t.me/BotFather)) and `uv sync --extra telegram`. It answers @mentions and replies in groups, keeps a short per-user history in SQLite, and lets each user pick a model (`/model`) and toggle reasoning (`/think`). It can also **search the web and read pages/PDFs** on demand via [Firecrawl](https://firecrawl.dev) — keyless by default (set `MLX_LAZYSERVE_FIRECRAWL_API_KEY` for higher limits, or `MLX_LAZYSERVE_TG_WEB_TOOLS=false` to turn it off). `MLX_LAZYSERVE_TG_OWNER_IDS` gates who can add it to a group or DM it. All `TG_*` options are in [`service.env.example`](deploy/service.env.example).
 
 ## Downloads from mainland China
 

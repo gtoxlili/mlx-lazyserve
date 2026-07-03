@@ -21,6 +21,7 @@ mlx-lm/mlx-vlm's per-model ``tool_parsers`` — no model-specific parsing is han
 from __future__ import annotations
 
 import gc
+import json
 import logging
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -241,6 +242,43 @@ def _fit_prompt(messages, build, token_len, max_prompt_tokens):
     return prompt
 
 
+def _normalize_tool_call_args(messages):
+    """Coerce each ``tool_calls[].function.arguments`` from a JSON *string* into a dict.
+
+    HF chat templates iterate a tool call's ``arguments`` as a mapping (Qwen's does
+    ``{% for k, v in tool_call.function.arguments | items %}``), but the OpenAI wire format —
+    and our own tool-call parser (mlx-vlm's ``process_tool_calls``) — carry ``arguments`` as a
+    JSON string. Feeding that back on a follow-up turn makes ``apply_chat_template`` raise
+    ``TypeError: Can only get item pairs from a mapping``, which surfaces as a 500 / failed
+    reply. Convert string args to dicts so a multi-turn tool exchange renders; leave dicts (and
+    unparseable strings) untouched. Returns a new list, shallow-copying only the messages/calls
+    it rewrites — the caller's list is never mutated.
+    """
+    out = []
+    for m in messages:
+        calls = m.get("tool_calls") if isinstance(m, dict) else None
+        if not calls:
+            out.append(m)
+            continue
+        new_calls = []
+        changed = False
+        for tc in calls:
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            args = fn.get("arguments") if isinstance(fn, dict) else None
+            if isinstance(args, str):
+                try:
+                    parsed = json.loads(args or "{}")
+                except (ValueError, TypeError):
+                    new_calls.append(tc)  # leave a malformed string as-is
+                    continue
+                new_calls.append({**tc, "function": {**fn, "arguments": parsed}})
+                changed = True
+            else:
+                new_calls.append(tc)
+        out.append({**m, "tool_calls": new_calls} if changed else m)
+    return out
+
+
 def _build_sampler(temperature, top_p, top_k, min_p):
     from mlx_lm.sample_utils import make_sampler
 
@@ -443,6 +481,7 @@ class MlxLmModel:
 
         from mlx_lm import stream_generate
 
+        messages = _normalize_tool_call_args(messages)
         prompt = _fit_prompt(
             messages,
             lambda ms: self._build_prompt(ms, tools, enable_thinking),
@@ -590,6 +629,7 @@ class MlxVlmModel:
         from mlx_vlm import stream_generate
 
         image_refs = self._resolve_images(images)
+        messages = _normalize_tool_call_args(messages)
         prompt = _fit_prompt(
             messages,
             lambda ms: self._build_prompt(ms, len(image_refs), tools, enable_thinking),
