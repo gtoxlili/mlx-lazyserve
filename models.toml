@@ -37,3 +37,12 @@ default = true
 # 256k-capable; only ~5 GB of weights leaves lots of room. With 8-bit KV, 128k ≈ 8.6 GB KV
 # fits comfortably (could push ~192k). This is the bot's default model, so keep it responsive.
 context = 131072
+
+# --- New Qwythos/Claude Mythos reasoning tune: text-only 4-bit MLX, ~4.8 GB ---
+[models."qwythos-9b"]
+# Community mxfp4 MLX conversion of empero-ai/Qwythos-9B-Claude-Mythos-5-1M.
+# Only 8/32 layers use full attention, so KV grows slowly. Bot default is 4-bit KV:
+# 512k ≈ 4 GiB KV; 1M fits on paper but makes huge-paste prefill too easy to trigger.
+repo = "sahilchachra/Qwythos-9B-Claude-Mythos-5-1M-mxfp4-mlx"
+engine = "mlx_lm"
+context = 524288

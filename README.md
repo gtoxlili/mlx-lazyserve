@@ -30,11 +30,12 @@ Configured in [`models.toml`](models.toml). Weights download lazily into `~/.cac
 
 | name | repo | size | role |
 |---|---|---|---|
-| `gemma4-26b-uncensored` *(default)* | `Jiunsong/supergemma4-26b-uncensored-mlx-4bit-v2` | ~14.2 GB | **main** — uncensored SuperGemma4 26B-A4B MoE; comfortable on 24 GB |
+| `gemma4-26b-uncensored` | `Jiunsong/supergemma4-26b-uncensored-mlx-4bit-v2` | ~14.2 GB | **main** — uncensored SuperGemma4 26B-A4B MoE; comfortable on 24 GB |
 | `qwen3.6-35b-a3b` | `TheCluster/Qwen3.6-35B-A3B-Heretic-MLX-mixed-3.9bit` | ~18.7 GB | **main** — Heretic-abliterated 35B-A3B MoE; tight, raise wired limit (see below) |
-| `qwen3.5-9b` | `TheCluster/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-MLX-mxfp4` | ~5 GB | fallback — light & fast, always loads |
+| `qwen3.5-9b` *(default)* | `TheCluster/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-MLX-mxfp4` | ~5 GB | fallback — light & fast, always loads |
+| `qwythos-9b` | `sahilchachra/Qwythos-9B-Claude-Mythos-5-1M-mxfp4-mlx` | ~4.8 GB | Qwythos/Claude Mythos reasoning tune; text-only MLX 4-bit |
 
-All three are uncensored MLX builds. The two mains are MoE (~3–3.8B active) so they decode fast despite their size.
+All four are uncensored MLX builds. The two mains are MoE (~3–3.8B active) so they decode fast despite their size.
 
 > The exact HauhauCS Gemma is GGUF-only (no MLX), so the Gemma slots use the closest MLX equivalents.
 
