@@ -22,8 +22,10 @@ Configured in [`models.toml`](models.toml); weights download lazily into `~/.cac
 |---|---|---|
 | `gemma4-26b-uncensored` | `Jiunsong/supergemma4-26b-uncensored-mlx-4bit-v2` | ~14 GB |
 | `qwen3.6-35b-a3b` | `TheCluster/Qwen3.6-35B-A3B-Heretic-MLX-mixed-3.9bit` | ~19 GB |
-| `qwen3.5-9b` (default) | `TheCluster/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-MLX-mxfp4` | ~5 GB |
+| `qwen3.5-9b` | `TheCluster/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-MLX-mxfp4` | ~5 GB |
 | `qwythos-9b` | `sahilchachra/Qwythos-9B-Claude-Mythos-5-1M-mxfp4-mlx` | ~5 GB |
+| `josiefied-qwen3-4b` (default) | `mlx-community/Josiefied-Qwen3-4B-Instruct-2507-abliterated-v2-mxfp4` | ~2 GB |
+| `huihui-qwen3.5-4b-opus-abliterated` | `mlx-community/Huihui-Qwen3.5-4B-Claude-4.6-Opus-abliterated-4bit` | ~3 GB |
 
 Edit `models.toml` to add your own; any MLX repo on Hugging Face works.
 

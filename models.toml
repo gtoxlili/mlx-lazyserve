@@ -33,9 +33,8 @@ context = 32768
 # HauhauCS Aggressive uncensored, community MLX conversion (mxfp4).
 repo = "TheCluster/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-MLX-mxfp4"
 engine = "auto"
-default = true
 # 256k-capable; only ~5 GB of weights leaves lots of room. With 8-bit KV, 128k ≈ 8.6 GB KV
-# fits comfortably (could push ~192k). This is the bot's default model, so keep it responsive.
+# fits comfortably (could push ~192k).
 context = 131072
 
 # --- New Qwythos/Claude Mythos reasoning tune: text-only 4-bit MLX, ~4.8 GB ---
@@ -46,3 +45,17 @@ context = 131072
 repo = "sahilchachra/Qwythos-9B-Claude-Mythos-5-1M-mxfp4-mlx"
 engine = "mlx_lm"
 context = 524288
+
+# --- Small abliterated Qwen3 picks: cheap to keep around, fast to swap/test ---
+[models."josiefied-qwen3-4b"]
+repo = "mlx-community/Josiefied-Qwen3-4B-Instruct-2507-abliterated-v2-mxfp4"
+engine = "mlx_lm"
+default = true
+# Qwen3-4B maxes at 256k, but all 36 layers use full attention. With API 8-bit KV,
+# 192k is the practical default on 24 GB; 256k is possible but leaves little headroom.
+context = 196608
+
+[models."huihui-qwen3.5-4b-opus-abliterated"]
+repo = "mlx-community/Huihui-Qwen3.5-4B-Claude-4.6-Opus-abliterated-4bit"
+engine = "auto"
+context = 131072

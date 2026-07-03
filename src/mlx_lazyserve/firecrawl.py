@@ -16,6 +16,7 @@ never pulls a hard dependency into the core install.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
@@ -117,12 +118,16 @@ class FirecrawlClient:
         result_chars: int = 6000,
         search_limit: int = 5,
         timeout: float = 45.0,
+        retries: int = 2,
+        retry_delay: float = 0.75,
     ) -> None:
         import httpx
 
         self._base = base_url.rstrip("/")
         self._result_chars = max(500, int(result_chars))
         self._search_limit = max(1, min(10, int(search_limit)))
+        self._retries = max(0, int(retries))
+        self._retry_delay = max(0.0, float(retry_delay))
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"  # else keyless (rate-limited per IP)
@@ -151,10 +156,20 @@ class FirecrawlClient:
                     "and tell the user the information may be out of date)"
                 )
             logger.warning("firecrawl %s -> HTTP %s", name, code)
-            return f"(web tool error: HTTP {code})"
-        except Exception as exc:  # timeout, connection, bad JSON, …
-            logger.warning("firecrawl %s failed: %s", name, exc)
-            return f"(web tool error: {exc})"
+            return (
+                f"(web tool error: HTTP {code}. Tell the user the fetch failed; "
+                "do NOT guess or invent the content.)"
+            )
+        except Exception as exc:  # timeout / connection / DNS / proxy / bad JSON …
+            # These are often httpx timeout/connect errors whose str() is EMPTY, so log the
+            # exception *type* too — otherwise the log line reads "failed: " with no clue.
+            detail = str(exc).strip() or type(exc).__name__
+            logger.warning("firecrawl %s failed: %s (%s)", name, detail, type(exc).__name__)
+            return (
+                f"(web tool could not reach the internet [{type(exc).__name__}]. Tell the user "
+                "the web lookup failed and you could not fetch it; do NOT guess or invent the "
+                "page contents.)"
+            )
 
     # ------------------------------------------------------------------ endpoints
 
@@ -194,9 +209,32 @@ class FirecrawlClient:
         return self._cap(md)
 
     async def _post(self, path: str, payload: dict) -> dict:
-        resp = await self._client.post(f"{self._base}{path}", json=payload)
-        resp.raise_for_status()
-        return resp.json()
+        """POST with retries on *transport* errors (connect/TLS/timeout — often transient over a
+        proxied or shaky link). HTTP status errors (4xx/5xx) are NOT retried — they're real and
+        handled by the caller. A flapping route's SSL_ERROR_SYSCALL / ConnectError surfaces as
+        httpx.TransportError, so a couple of quick retries usually ride through the wobble."""
+        import httpx
+
+        last: Exception | None = None
+        for attempt in range(self._retries + 1):
+            try:
+                resp = await self._client.post(f"{self._base}{path}", json=payload)
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPStatusError:
+                raise
+            except httpx.TransportError as exc:
+                last = exc
+                if attempt < self._retries:
+                    logger.debug(
+                        "firecrawl %s transport error (%s); retry %d/%d",
+                        path, type(exc).__name__, attempt + 1, self._retries,
+                    )
+                    await asyncio.sleep(self._retry_delay * (attempt + 1))
+                    continue
+                raise
+        assert last is not None
+        raise last
 
     def _cap(self, text: str) -> str:
         if len(text) <= self._result_chars:
