@@ -46,16 +46,11 @@ repo = "sahilchachra/Qwythos-9B-Claude-Mythos-5-1M-mxfp4-mlx"
 engine = "mlx_lm"
 context = 524288
 
-# --- Small abliterated Qwen3 picks: cheap to keep around, fast to swap/test ---
-[models."josiefied-qwen3-4b"]
-repo = "mlx-community/Josiefied-Qwen3-4B-Instruct-2507-abliterated-v2-mxfp4"
+# --- Default small model: MLX 4-bit conversion of AliesTaha/fable-traces ---
+[models."fable-traces-4b"]
+repo = "gtoxlili/fable-traces-mlx-mxfp4"
 engine = "mlx_lm"
 default = true
-# Qwen3-4B maxes at 256k, but all 36 layers use full attention. With API 8-bit KV,
-# 192k is the practical default on 24 GB; 256k is possible but leaves little headroom.
+# Inherits Qwen3-4B-Instruct-2507's 256k limit. All 36 layers use full attention,
+# so 192k is the practical default on 24 GB; 256k leaves little headroom.
 context = 196608
-
-[models."huihui-qwen3.5-4b-opus-abliterated"]
-repo = "mlx-community/Huihui-Qwen3.5-4B-Claude-4.6-Opus-abliterated-4bit"
-engine = "auto"
-context = 131072
