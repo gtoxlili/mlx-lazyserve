@@ -24,7 +24,7 @@ Configured in [`models.toml`](models.toml); weights download lazily into `~/.cac
 | `qwen3.6-35b-a3b` | `TheCluster/Qwen3.6-35B-A3B-Heretic-MLX-mixed-3.9bit` | ~19 GB |
 | `qwen3.5-9b` | `TheCluster/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-MLX-mxfp4` | ~5 GB |
 | `qwythos-9b` | `sahilchachra/Qwythos-9B-Claude-Mythos-5-1M-mxfp4-mlx` | ~5 GB |
-| `fable-traces-4b` (default) | `gtoxlili/fable-traces-mlx-mxfp4` | ~2 GB |
+| `qwopus-fable5-4b` (default) | `shuhulx/Qwopus3.5-4B-Coder-Fable5-v1-MLX-4bit` | ~2.4 GB |
 
 Edit `models.toml` to add your own; any MLX repo on Hugging Face works.
 

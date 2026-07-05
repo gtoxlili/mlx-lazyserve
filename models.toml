@@ -46,11 +46,10 @@ repo = "sahilchachra/Qwythos-9B-Claude-Mythos-5-1M-mxfp4-mlx"
 engine = "mlx_lm"
 context = 524288
 
-# --- Default small model: MLX 4-bit conversion of AliesTaha/fable-traces ---
-[models."fable-traces-4b"]
-repo = "gtoxlili/fable-traces-mlx-mxfp4"
+# --- Default small Fable coder/agent model: Qwen3.5-4B, MLX 4-bit ---
+[models."qwopus-fable5-4b"]
+repo = "shuhulx/Qwopus3.5-4B-Coder-Fable5-v1-MLX-4bit"
 engine = "mlx_lm"
 default = true
-# Inherits Qwen3-4B-Instruct-2507's 256k limit. All 36 layers use full attention,
-# so 192k is the practical default on 24 GB; 256k leaves little headroom.
+# Qwen3.5-4B-class model. Keep the 192k ceiling: useful for agent traces, still sane on 24 GB.
 context = 196608
