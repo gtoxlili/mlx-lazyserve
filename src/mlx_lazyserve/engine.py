@@ -28,6 +28,13 @@ from types import SimpleNamespace
 
 logger = logging.getLogger(__name__)
 
+_FIM_MARKERS = (
+    "<|fim_prefix|>",
+    "<|fim_middle|>",
+    "<|fim_suffix|>",
+    "<|fim_pad|>",
+)
+
 
 def clear_mlx_cache() -> None:
     """Return cached MLX/Metal buffers to the system after unloading a model."""
@@ -53,6 +60,116 @@ def _find_stop(text: str, stops: list[str]) -> int:
         if i != -1 and (best == -1 or i < best):
             best = i
     return best
+
+
+def _strip_fim_from_messages(messages):
+    """Remove leaked FIM control markers from prior assistant turns.
+
+    User/system text is deliberately left alone so a user can discuss the marker itself.
+    Only messages that need rewriting are copied.
+    """
+    out = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            out.append(message)
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            out.append(message)
+            continue
+        clean = content
+        for marker in _FIM_MARKERS:
+            clean = clean.replace(marker, "")
+        out.append({**message, "content": clean} if clean != content else message)
+    return out
+
+
+def _without_fim_markers(raw_iter: Iterator[str]) -> Iterator[str]:
+    """Strip FIM markers from a text stream, including markers split across chunks."""
+    pending = ""
+    try:
+        for text in raw_iter:
+            if not text:
+                continue
+            pending += text
+            for marker in _FIM_MARKERS:
+                pending = pending.replace(marker, "")
+
+            # Retain only a suffix that could be the beginning of a split marker.
+            hold = 0
+            for marker in _FIM_MARKERS:
+                for length in range(min(len(marker) - 1, len(pending)), 0, -1):
+                    if pending.endswith(marker[:length]):
+                        hold = max(hold, length)
+                        break
+            if len(pending) > hold:
+                yield pending[:-hold] if hold else pending
+                pending = pending[-hold:] if hold else ""
+    except GeneratorExit:
+        _close(raw_iter)
+        raise
+    if pending:
+        # An incomplete marker is ordinary text and must not be dropped.
+        yield pending
+    _close(raw_iter)
+
+
+def _fim_token_ids(tokenizer) -> tuple[int, ...]:
+    """Return FIM markers that are represented by one exact tokenizer token."""
+    found = []
+    for marker in _FIM_MARKERS:
+        try:
+            ids = list(tokenizer.encode(marker, add_special_tokens=False))
+            if len(ids) != 1:
+                continue
+            token_id = int(ids[0])
+            if tokenizer.decode([token_id], skip_special_tokens=False) == marker:
+                found.append(token_id)
+        except Exception:
+            continue
+    return tuple(dict.fromkeys(found))
+
+
+def _events_with_empty_content_retry(
+    make_events, enable_thinking, repo="", allow_retry=True
+) -> Iterator[dict]:
+    """Retry once without thinking when a thinking pass produces no answer.
+
+    Reasoning from the first pass can be streamed immediately. Usage is held until both
+    passes finish so callers receive one cumulative usage event.
+    """
+    usages = []
+    has_content = False
+    has_tool_calls = False
+
+    for event in make_events(enable_thinking):
+        if "usage" in event:
+            usages.append(event["usage"])
+            continue
+        if event.get("content") and event["content"].strip():
+            has_content = True
+        if event.get("tool_calls"):
+            has_tool_calls = True
+        yield event
+
+    if allow_retry and enable_thinking and not has_content and not has_tool_calls:
+        logger.warning("%s produced no answer after thinking; retrying without thinking", repo)
+        for event in make_events(False):
+            if "usage" in event:
+                usages.append(event["usage"])
+                continue
+            yield event
+
+    if usages:
+        prompt_tokens = sum(int(u.get("prompt_tokens", 0)) for u in usages)
+        completion_tokens = sum(int(u.get("completion_tokens", 0)) for u in usages)
+        yield {
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }
+        }
 
 
 def _parse_events(raw_iter, enable_thinking, tool_module, tools, stop=None) -> Iterator[dict]:
@@ -297,6 +414,7 @@ def _build_logits_processors(
     frequency_penalty,
     repetition_context_size,
     structured,
+    blocked_token_ids=(),
 ):
     """mlx-lm logit-bias/penalty processors + an optional structured-output processor."""
     procs: list = []
@@ -317,6 +435,16 @@ def _build_logits_processors(
         procs = list(make_logits_processors(**kwargs))
     if structured is not None:
         procs.append(structured)
+    if blocked_token_ids:
+        import mlx.core as mx
+
+        indices = mx.array(list(blocked_token_ids))
+
+        def block_control_tokens(_, logits):
+            # Apply last so neither caller logit_bias nor a grammar can re-enable FIM tokens.
+            return logits.at[:, indices].add(-mx.inf)
+
+        procs.append(block_control_tokens)
     return procs or None
 
 
@@ -417,6 +545,10 @@ class MlxLmModel:
 
         self.repo = repo
         self.model, self.tokenizer = load(repo)
+        hf_tok = getattr(self.tokenizer, "_tokenizer", self.tokenizer)
+        self._blocked_token_ids = _fim_token_ids(hf_tok)
+        if self._blocked_token_ids:
+            logger.info("blocking FIM token ids for %s: %s", repo, self._blocked_token_ids)
 
     def _tool_module(self):
         """Build a tool-parser shim from the tokenizer's native tool-call attributes."""
@@ -481,13 +613,7 @@ class MlxLmModel:
 
         from mlx_lm import stream_generate
 
-        messages = _normalize_tool_call_args(messages)
-        prompt = _fit_prompt(
-            messages,
-            lambda ms: self._build_prompt(ms, tools, enable_thinking),
-            self._prompt_token_len,
-            max_prompt_tokens,
-        )
+        messages = _strip_fim_from_messages(_normalize_tool_call_args(messages))
         tool_module = self._tool_module() if tools else None
         hf_tok = getattr(self.tokenizer, "_tokenizer", self.tokenizer)
         structured = _build_structured(hf_tok, response_format)
@@ -498,8 +624,8 @@ class MlxLmModel:
             frequency_penalty,
             repetition_context_size,
             structured,
+            self._blocked_token_ids,
         )
-        _apply_seed(seed)
         gen_kw = {
             "max_tokens": max_tokens,
             "sampler": _build_sampler(temperature, top_p, top_k, min_p),
@@ -509,20 +635,33 @@ class MlxLmModel:
         if kv_bits:
             gen_kw["kv_bits"] = int(kv_bits)
 
-        usage: dict = {}
-
-        def raw():
-            yield from _raw_with_kv_fallback(
-                lambda kw: stream_generate(self.model, self.tokenizer, prompt, **kw),
-                gen_kw,
-                usage,
+        def make_events(thinking):
+            prompt = _fit_prompt(
+                messages,
+                lambda ms: self._build_prompt(ms, tools, thinking),
+                self._prompt_token_len,
+                max_prompt_tokens,
             )
+            _apply_seed(seed)
+            usage: dict = {}
 
-        guarded = _loop_guarded(raw()) if loop_guard else raw()
-        yield from _parse_events(guarded, enable_thinking, tool_module, tools, stop)
-        ev = _usage_event(usage)
-        if ev:
-            yield ev
+            def raw():
+                yield from _raw_with_kv_fallback(
+                    lambda kw: stream_generate(self.model, self.tokenizer, prompt, **kw),
+                    gen_kw,
+                    usage,
+                )
+
+            clean = _without_fim_markers(raw())
+            guarded = _loop_guarded(clean) if loop_guard else clean
+            yield from _parse_events(guarded, thinking, tool_module, tools, stop)
+            ev = _usage_event(usage)
+            if ev:
+                yield ev
+
+        yield from _events_with_empty_content_retry(
+            make_events, enable_thinking, self.repo, allow_retry=not bool(stop)
+        )
 
     def close(self) -> None:
         self.model = None
@@ -544,6 +683,10 @@ class MlxVlmModel:
             self.config = load_config(repo)
         except Exception:
             self.config = getattr(self.model, "config", None)
+        hf_tok = getattr(self.processor, "tokenizer", self.processor)
+        self._blocked_token_ids = _fim_token_ids(hf_tok)
+        if self._blocked_token_ids:
+            logger.info("blocking FIM token ids for %s: %s", repo, self._blocked_token_ids)
 
     @staticmethod
     def _resolve_images(images) -> list:
@@ -629,13 +772,7 @@ class MlxVlmModel:
         from mlx_vlm import stream_generate
 
         image_refs = self._resolve_images(images)
-        messages = _normalize_tool_call_args(messages)
-        prompt = _fit_prompt(
-            messages,
-            lambda ms: self._build_prompt(ms, len(image_refs), tools, enable_thinking),
-            self._prompt_token_len,
-            max_prompt_tokens,
-        )
+        messages = _strip_fim_from_messages(_normalize_tool_call_args(messages))
         tool_module = self._tool_module() if tools else None
         hf_tok = getattr(self.processor, "tokenizer", self.processor)
         structured = _build_structured(hf_tok, response_format)
@@ -646,8 +783,8 @@ class MlxVlmModel:
             frequency_penalty,
             repetition_context_size,
             structured,
+            self._blocked_token_ids,
         )
-        _apply_seed(seed)
         gen_kw = {
             "image": image_refs or None,
             "max_tokens": max_tokens,
@@ -663,20 +800,33 @@ class MlxVlmModel:
         if kv_bits:
             gen_kw["kv_bits"] = int(kv_bits)
 
-        usage: dict = {}
-
-        def raw():
-            yield from _raw_with_kv_fallback(
-                lambda kw: stream_generate(self.model, self.processor, prompt, **kw),
-                gen_kw,
-                usage,
+        def make_events(thinking):
+            prompt = _fit_prompt(
+                messages,
+                lambda ms: self._build_prompt(ms, len(image_refs), tools, thinking),
+                self._prompt_token_len,
+                max_prompt_tokens,
             )
+            _apply_seed(seed)
+            usage: dict = {}
 
-        guarded = _loop_guarded(raw()) if loop_guard else raw()
-        yield from _parse_events(guarded, enable_thinking, tool_module, tools, stop)
-        ev = _usage_event(usage)
-        if ev:
-            yield ev
+            def raw():
+                yield from _raw_with_kv_fallback(
+                    lambda kw: stream_generate(self.model, self.processor, prompt, **kw),
+                    gen_kw,
+                    usage,
+                )
+
+            clean = _without_fim_markers(raw())
+            guarded = _loop_guarded(clean) if loop_guard else clean
+            yield from _parse_events(guarded, thinking, tool_module, tools, stop)
+            ev = _usage_event(usage)
+            if ev:
+                yield ev
+
+        yield from _events_with_empty_content_retry(
+            make_events, enable_thinking, self.repo, allow_retry=not bool(stop)
+        )
 
     def close(self) -> None:
         self.model = None
