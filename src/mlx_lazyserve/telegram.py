@@ -51,6 +51,18 @@ ACK_REACTION = "👀"  # reaction set on the triggering message while we think
 PROMPT_MARGIN = 256  # tokens held back from the context window (template/counting slack)
 
 
+class TelegramAPIError(RuntimeError):
+    """Telegram answered but rejected the call (``ok: false``).
+
+    Carries ``error_code`` so callers can tell a permanent rejection (401 bad
+    token, 404 malformed token) from a transient one (429 rate-limit, 5xx).
+    """
+
+    def __init__(self, method: str, description, error_code: int | None) -> None:
+        self.error_code = error_code
+        super().__init__(f"{method}: {description} (code {error_code})")
+
+
 @dataclass
 class Incoming:
     chat_id: int
@@ -236,10 +248,9 @@ class TelegramBot:
         timeout = httpx.Timeout(LONG_POLL_TIMEOUT + 15.0, connect=10.0)
         async with httpx.AsyncClient(base_url=API_BASE, timeout=timeout) as client:
             self._client = client
-            try:
-                me = await self._api("getMe")
-            except Exception as exc:
-                logger.error("Telegram getMe failed (%s); bot disabled", exc)
+            me = await self._getme_with_retry(stop)
+            if me is None:
+                logger.info("Telegram bot disabled (stopped before getMe succeeded)")
                 return
             self.bot_id = me["id"]
             self.username = me.get("username") or ""
@@ -301,6 +312,34 @@ class TelegramBot:
                     setattr(cfg.markdown_symbol, f"heading_level_{lvl}", "")
         except Exception as exc:
             logger.warning("telegramify-markdown config unavailable: %s", exc)
+
+    async def _getme_with_retry(self, stop: asyncio.Event) -> dict | None:
+        """Call getMe, retrying transient failures with backoff.
+
+        api.telegram.org can be briefly unreachable right when the service
+        starts (e.g. RunAtLoad at boot, before the network/proxy is up). A
+        one-shot getMe would disable the bot for the whole process lifetime,
+        so retry — mirroring the poll loop — until it succeeds or we stop.
+        A definitive rejection (bad/blank token) won't fix itself, so give up
+        on that with a clear message instead of spinning forever.
+        """
+        backoff = 1.0
+        while not stop.is_set():
+            try:
+                return await self._api("getMe")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if isinstance(exc, TelegramAPIError) and exc.error_code in (401, 404):
+                    logger.error(
+                        "Telegram getMe rejected (%s); check MLX_LAZYSERVE_TG_BOT_TOKEN — bot disabled",
+                        exc,
+                    )
+                    return None
+                logger.warning("Telegram getMe failed (%s); retrying in %.0fs", exc, backoff)
+                await self._sleep_or_stop(stop, backoff)
+                backoff = min(backoff * 2, 30.0)
+        return None
 
     async def _poll_loop(self, stop: asyncio.Event) -> None:
         offset: int | None = None
@@ -1117,7 +1156,7 @@ class TelegramBot:
         except Exception:
             raise RuntimeError(f"{method}: HTTP {resp.status_code}")
         if not data.get("ok"):
-            raise RuntimeError(f"{method}: {data.get('description')} (code {data.get('error_code')})")
+            raise TelegramAPIError(method, data.get("description"), data.get("error_code"))
         return data.get("result")
 
     async def _api_quiet(self, method: str, **params):
