@@ -580,6 +580,11 @@ class TelegramBot:
             reply_markup=self._model_keyboard(current),
         )
 
+    def _thinking_default(self, model: str | None) -> bool:
+        """Bot thinking default for a model: its per-model tg_enable_thinking (off unless set)."""
+        spec = self.settings.models.get(model) if model else None
+        return spec.tg_enable_thinking if spec is not None else False
+
     async def _cmd_think(self, chat_id, user_id, reply_to, arg: str) -> None:
         """/think — toggle this user's reasoning (inline keyboard, or /think on|off)."""
         chan = self._get_channel(chat_id, user_id)
@@ -595,7 +600,10 @@ class TelegramBot:
             await self._save_pref(chat_id, user_id, thinking=False)
             await self._send_plain(chat_id, "✅ 思考已关闭", reply_to)
             return
-        current = chan.thinking if chan.thinking is not None else self.settings.tg_enable_thinking
+        current = (
+            chan.thinking if chan.thinking is not None
+            else self._thinking_default(chan.model or self.default_model)
+        )
         await self._api_quiet(
             "sendMessage",
             chat_id=chat_id,
@@ -733,7 +741,10 @@ class TelegramBot:
 
             await self._ensure_loaded(chan, chat_id, user_id)
             model = chan.model or self.default_model
-            thinking = chan.thinking if chan.thinking is not None else self.settings.tg_enable_thinking
+            thinking = (
+                chan.thinking if chan.thinking is not None
+                else self._thinking_default(model)
+            )
 
             # Arm the interrupt BEFORE any await, so a message arriving during the
             # acknowledgement round-trips still aborts this generation (no lost merge).

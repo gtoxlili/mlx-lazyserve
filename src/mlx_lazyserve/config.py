@@ -17,6 +17,8 @@ class ModelSpec:
     engine: str = "auto"  # "auto" | "mlx_lm" | "mlx_vlm"
     default: bool = False
     context: int = 8192  # context window (tokens); the bot trims prompts to fit it
+    enable_thinking: bool = False  # API reasoning default for this model (off unless set)
+    tg_enable_thinking: bool = False  # Telegram-bot reasoning default for this model (off unless set)
 
 
 @dataclass(frozen=True)
@@ -25,7 +27,6 @@ class Settings:
     port: int
     idle_timeout: float  # seconds of inactivity before unloading (0 = never)
     default_max_tokens: int
-    default_enable_thinking: bool  # default for the chat-template thinking switch
     default_kv_bits: int  # if > 0, quantize the KV cache to N bits (saves memory)
     default_repetition_penalty: float  # default penalty applied when a request omits it
     default_min_p: float  # default min-p sampling floor for the API (0 = off)
@@ -45,7 +46,6 @@ class Settings:
     tg_repetition_penalty: float  # repetition penalty for bot replies (curbs loops)
     tg_min_p: float  # min-p sampling floor for bot replies
     tg_history_turns: int  # per-(chat,user) (user,assistant) pairs kept as context
-    tg_enable_thinking: bool  # if true, render reasoning as an expandable blockquote
     tg_db_path: Path  # SQLite file persisting per-(chat,user) conversation history
     tg_owner_ids: tuple[int, ...]  # user ids allowed to add the bot to a group; empty = anyone
     # Web tools (Firecrawl) for the bot: let the model search the web + read pages/PDFs.
@@ -80,6 +80,8 @@ def _load_models() -> tuple[dict[str, ModelSpec], str | None]:
                 engine=spec.get("engine", "auto"),
                 default=bool(spec.get("default", False)),
                 context=int(spec.get("context", 8192)),
+                enable_thinking=bool(spec.get("enable_thinking", False)),
+                tg_enable_thinking=bool(spec.get("tg_enable_thinking", False)),
             )
             models[name] = ms
             if ms.default and default_model is None:
@@ -155,10 +157,6 @@ def load_settings() -> Settings:
         port=int(os.environ.get("MLX_LAZYSERVE_PORT", "41434")),
         idle_timeout=float(os.environ.get("MLX_LAZYSERVE_IDLE_TIMEOUT", "600")),
         default_max_tokens=int(os.environ.get("MLX_LAZYSERVE_MAX_TOKENS", "8192")),
-        default_enable_thinking=os.environ.get("MLX_LAZYSERVE_ENABLE_THINKING", "false")
-        .strip()
-        .lower()
-        in ("1", "true", "yes", "on"),
         default_kv_bits=int(os.environ.get("MLX_LAZYSERVE_KV_BITS", "0")),
         default_repetition_penalty=_float_env("MLX_LAZYSERVE_REPETITION_PENALTY", 1.1),
         default_min_p=_float_env("MLX_LAZYSERVE_MIN_P", 0.0),
@@ -186,11 +184,6 @@ def load_settings() -> Settings:
         tg_min_p=_float_env("MLX_LAZYSERVE_TG_MIN_P", 0.05),
         tg_history_turns=_int_env("MLX_LAZYSERVE_TG_HISTORY_TURNS", 8),
         tg_db_path=tg_db_path,
-        tg_enable_thinking=_bool_env(
-            "MLX_LAZYSERVE_TG_ENABLE_THINKING",
-            os.environ.get("MLX_LAZYSERVE_ENABLE_THINKING", "false").strip().lower()
-            in ("1", "true", "yes", "on"),
-        ),
         tg_owner_ids=tg_owner_ids,
         tg_web_tools=_bool_env("MLX_LAZYSERVE_TG_WEB_TOOLS", True),
         firecrawl_api_key=os.environ.get("MLX_LAZYSERVE_FIRECRAWL_API_KEY", "").strip(),

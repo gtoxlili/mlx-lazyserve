@@ -7,6 +7,10 @@
 #            "mlx_vlm"  force the vision-language engine (required for image input)
 #   context = 32768     context window in tokens (default 8192). The Telegram bot trims
 #                       old history so the prompt + reserved output stay within this.
+#   enable_thinking = true      API reasoning default for this model (default false); a
+#                               per-request enable_thinking still overrides it.
+#   tg_enable_thinking = true   Telegram-bot reasoning default (default false); a user's
+#                               /think toggle still overrides it. Independent of enable_thinking.
 
 # --- Main daily driver: comfortable on 24 GB, strongest for agent / code / text ---
 [models."gemma4-26b-uncensored"]
@@ -46,10 +50,21 @@ repo = "sahilchachra/Qwythos-9B-Claude-Mythos-5-1M-mxfp4-mlx"
 engine = "mlx_lm"
 context = 524288
 
-# --- Default small Fable coder/agent model: Qwen3.5-4B, MLX 4-bit ---
-[models."qwopus-fable5-4b"]
-repo = "shuhulx/Qwopus3.5-4B-Coder-Fable5-v1-MLX-4bit"
+# --- Default small Fable coder/agent model: MiniCPM5-1B (Llama arch), MLX 8-bit ---
+[models."cpmopus-fable5-1b"]
+# MiniCPM5-1B-Claude-Opus-Fable5-Thinking — a 1B Llama-arch reasoning/coding tune (Opus
+# Fable5 data, Qwen3-style <think> mode). No MLX build existed upstream (only GGUF), so
+# converted from the safetensors checkpoint to 8-bit MLX (~1.1 GB, near-lossless, ~100+
+# tok/s on M4 Pro) and published to the Hub. Regenerate with:
+#   mlx_lm.convert --hf-path GnLOLot/MiniCPM5-1B-Claude-Opus-Fable5-Thinking -q --q-bits 8
+repo = "gtoxlili/MiniCPM5-1B-Claude-Opus-Fable5-Thinking-MLX-8bit"
 engine = "mlx_lm"
 default = true
-# Qwen3.5-4B-class model. Keep the 192k ceiling: useful for agent traces, still sane on 24 GB.
-context = 196608
+# Thinking on by default on both surfaces — a 1B leans on chain-of-thought to punch above
+# its size. (A per-request enable_thinking / the bot's /think toggle still override these.)
+enable_thinking = true       # API default
+tg_enable_thinking = true    # Telegram-bot default
+# 128k (131072) is the model's max supported context: max_position_embeddings, and the model
+# card states "Context Length: 131,072" with no rope-scaling/YaRN to extend it. So this is the
+# real ceiling — anything higher would just be RoPE extrapolation past what it was built for.
+context = 131072

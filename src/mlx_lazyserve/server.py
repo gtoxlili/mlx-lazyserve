@@ -131,14 +131,15 @@ def _resolve_tools(body: dict):
     return body.get("tools") or None
 
 
-def _enable_thinking(body: dict) -> bool:
-    """Per-request thinking switch: body.enable_thinking or chat_template_kwargs, else default."""
+def _enable_thinking(body: dict, model: str | None = None) -> bool:
+    """Per-request thinking switch: explicit request value, else the model's default (off unless set)."""
     if "enable_thinking" in body:
         return bool(body["enable_thinking"])
     cck = body.get("chat_template_kwargs")
     if isinstance(cck, dict) and "enable_thinking" in cck:
         return bool(cck["enable_thinking"])
-    return settings.default_enable_thinking
+    spec = settings.models.get(model) if model else None
+    return spec.enable_thinking if spec is not None else False
 
 
 def _split_multimodal(messages: list[dict]) -> tuple[list[dict], list[str]]:
@@ -338,7 +339,7 @@ async def chat_completions(request: Request):
     params["images"] = images
     params["tools"] = tools
     # structured output emits JSON directly — incompatible with free-form <think> reasoning
-    params["enable_thinking"] = False if structured else _enable_thinking(body)
+    params["enable_thinking"] = False if structured else _enable_thinking(body, model)
     params["response_format"] = rf if structured else None
     if structured:
         params["loop_guard"] = False  # never truncate grammar-constrained JSON mid-stream
