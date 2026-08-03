@@ -13,12 +13,29 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 @dataclass(frozen=True)
 class ModelSpec:
     name: str  # friendly id exposed over the API, e.g. "qwen3.5-9b"
-    repo: str  # Hugging Face MLX repo id
+    repo: str  # Hugging Face MLX repo id ("" for kind="video", which loads from `path`)
     engine: str = "auto"  # "auto" | "mlx_lm" | "mlx_vlm"
     default: bool = False
     context: int = 8192  # context window (tokens); the bot trims prompts to fit it
     enable_thinking: bool = False  # API reasoning default for this model (off unless set)
     tg_enable_thinking: bool = False  # Telegram-bot reasoning default for this model (off unless set)
+    # --- video models (kind="video") ---------------------------------------
+    # A video model is NOT loaded in-process: it runs in the mlx-serve (Zig)
+    # subprocess, which owns ~19 GB while alive. It competes for the same single
+    # slot as the text models, so only one of the two can exist at a time.
+    kind: str = "text"  # "text" | "video"
+    path: str = ""  # local weights dir (video only — 40 GB, too big to pull lazily)
+
+
+@dataclass(frozen=True)
+class VideoDefaults:
+    """Per-request defaults for video generation, overridable by the caller."""
+
+    width: int
+    height: int
+    frames: int  # snapped UP to the model's 17k+5 ladder by the backend
+    steps: int
+    fps: int
 
 
 @dataclass(frozen=True)
@@ -55,6 +72,19 @@ class Settings:
     tg_web_max_iters: int  # max model<->tool round-trips before the model must answer
     tg_web_result_chars: int  # cap per tool result fed back to the model (context hygiene)
     tg_web_search_limit: int  # default web_search result count
+    # Video generation (MiniMax-H3 via the mlx-serve Zig backend). Off unless a
+    # kind="video" model is registered in models.toml.
+    video_binary: str  # path to the mlx-serve executable; "" = video disabled
+    video_port: int  # loopback port the backend listens on (never exposed)
+    video_out_dir: Path  # where finished mp4s land (external disk — they are large)
+    video_db_path: Path  # SQLite job store; survives a restart mid-queue
+    video_idle_timeout: float  # seconds with an empty queue before killing the backend
+    video_load_timeout: float  # seconds to wait for the backend to answer /health
+    video_retention_hours: float  # delete finished artifacts older than this (0 = keep)
+    video_defaults: VideoDefaults
+    minimax_api_key: str  # MiniMax Open Platform key for Context-IR prompt expansion
+    minimax_base_url: str  # Open Platform base URL
+    video_prompt_mode: str  # "expand" (Context-IR) | "raw" (caller wrote the structure)
 
 
 def _registry_path() -> Path:
@@ -74,20 +104,27 @@ def _load_models() -> tuple[dict[str, ModelSpec], str | None]:
     if path.exists():
         data = tomllib.loads(path.read_text(encoding="utf-8"))
         for name, spec in (data.get("models") or {}).items():
+            kind = spec.get("kind", "text")
             ms = ModelSpec(
                 name=name,
-                repo=spec["repo"],
+                # A video model has no HF repo: its 40 GB of weights are staged on
+                # local disk, so `path` is required and `repo` stays empty.
+                repo=spec.get("repo", "") if kind == "video" else spec["repo"],
                 engine=spec.get("engine", "auto"),
                 default=bool(spec.get("default", False)),
                 context=int(spec.get("context", 8192)),
                 enable_thinking=bool(spec.get("enable_thinking", False)),
                 tg_enable_thinking=bool(spec.get("tg_enable_thinking", False)),
+                kind=kind,
+                path=str(spec.get("path", "")),
             )
             models[name] = ms
-            if ms.default and default_model is None:
+            # A video model must never become the implicit chat default — it cannot
+            # serve /v1/chat/completions at all.
+            if ms.default and default_model is None and ms.kind == "text":
                 default_model = name
-    if default_model is None and models:
-        default_model = next(iter(models))
+    if default_model is None:
+        default_model = next((n for n, m in models.items() if m.kind == "text"), None)
     return models, default_model
 
 
@@ -134,6 +171,11 @@ def _float_env(name: str, default: float) -> float:
     if raw is None or not raw.strip():
         return default
     return float(raw)
+
+
+def _path_env(name: str, default: Path) -> Path:
+    raw = os.environ.get(name, "").strip()
+    return Path(raw).expanduser() if raw else default
 
 
 def load_settings() -> Settings:
@@ -193,4 +235,31 @@ def load_settings() -> Settings:
         tg_web_max_iters=_int_env("MLX_LAZYSERVE_TG_WEB_MAX_ITERS", 3),
         tg_web_result_chars=_int_env("MLX_LAZYSERVE_TG_WEB_RESULT_CHARS", 6000),
         tg_web_search_limit=_int_env("MLX_LAZYSERVE_TG_WEB_SEARCH_LIMIT", 5),
+        video_binary=os.environ.get("MLX_LAZYSERVE_VIDEO_BINARY", "").strip(),
+        video_port=_int_env("MLX_LAZYSERVE_VIDEO_PORT", 41435),
+        video_out_dir=_path_env("MLX_LAZYSERVE_VIDEO_OUT_DIR", PROJECT_ROOT / "videos"),
+        video_db_path=_path_env("MLX_LAZYSERVE_VIDEO_DB_PATH", PROJECT_ROOT / "video-jobs.db"),
+        # A job takes minutes to hours, so the backend is worth keeping warm across a
+        # queued batch; 5 min of an empty queue then gives the ~19 GB back to chat.
+        video_idle_timeout=_float_env("MLX_LAZYSERVE_VIDEO_IDLE_TIMEOUT", 300.0),
+        # 34.5 GB of weights off an external SSD — generous, and it only has to be
+        # right once per backend spawn.
+        video_load_timeout=_float_env("MLX_LAZYSERVE_VIDEO_LOAD_TIMEOUT", 900.0),
+        video_retention_hours=_float_env("MLX_LAZYSERVE_VIDEO_RETENTION_HOURS", 168.0),
+        video_defaults=VideoDefaults(
+            # 256x256 x 5 frames is the cheap smoke-test shape; the real target is
+            # 768-short-edge, which the caller asks for explicitly.
+            width=_int_env("MLX_LAZYSERVE_VIDEO_WIDTH", 256),
+            height=_int_env("MLX_LAZYSERVE_VIDEO_HEIGHT", 256),
+            frames=_int_env("MLX_LAZYSERVE_VIDEO_FRAMES", 5),
+            steps=_int_env("MLX_LAZYSERVE_VIDEO_STEPS", 50),
+            fps=_int_env("MLX_LAZYSERVE_VIDEO_FPS", 24),
+        ),
+        minimax_api_key=os.environ.get("MLX_LAZYSERVE_MINIMAX_API_KEY", "").strip(),
+        # No version suffix: the Context-IR endpoints are /v2/*, and the client
+        # joins the path itself.
+        minimax_base_url=_str_env(
+            "MLX_LAZYSERVE_MINIMAX_BASE_URL", "https://api.minimax.io"
+        ),
+        video_prompt_mode=_str_env("MLX_LAZYSERVE_VIDEO_PROMPT_MODE", "expand"),
     )

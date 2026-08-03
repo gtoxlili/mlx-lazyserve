@@ -13,6 +13,7 @@ Why MLX instead of Ollama: on Apple Silicon MLX decodes MoE models noticeably fa
 - Text and vision-language models (tries `mlx-lm`, falls back to `mlx-vlm`)
 - Optional bearer-token auth, a `launchd` service for 24/7, and a maintenance mode
 - Optional embedded Telegram bot (with web search + page/PDF reading via Firecrawl)
+- Optional video generation (MiniMax-H3): `/v1/videos`, video with synchronized stereo audio
 
 ## Models
 
@@ -87,6 +88,92 @@ sudo install -m 0440 -o root -g wheel launchd/mlx-lazyserve.sudoers /etc/sudoers
 ```
 
 Without the rule the service still runs on the default cap (it just logs a warning).
+
+## Video generation (MiniMax-H3)
+
+Optional, off unless configured. Generates video with a synchronized stereo soundtrack from a prompt, optionally anchored to a first and/or last frame.
+
+This one does not run in-process. The model is [MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3), a 33B video DiT, and the MLX implementation lives in [ddalcu/mlx-serve](https://github.com/ddalcu/mlx-serve) — a native Zig server that talks to MLX's C API. mlx-lazyserve spawns it as a child process, owns the queue and the job lifecycle, and makes the mp4. So the split is: Python owns the API, Zig owns the math.
+
+Three reasons it's a subprocess rather than a binding. A job runs for minutes to hours, so IPC cost is noise. Killing the process is the only way to be certain the DiT's ~11 GB actually goes back to the OS, and on 24 GB that reclamation is the whole game. And an MLX over-commit hard-crashes the backend — as a child that's a failed job, in-process it would take the chat API down with it.
+
+### Setup
+
+Build the backend and stage the weights:
+
+```bash
+git clone --recurse-submodules -b feature/minmax-h3 https://github.com/ddalcu/mlx-serve
+cd mlx-serve && bash scripts/fetch-zig.sh && bash scripts/fetch-llama.sh
+bash scripts/build-mlx.sh          # or stage brew's mlx + mlx-c into lib/mlx/
+.zig-toolchain/zig build -Doptimize=ReleaseFast
+
+hf download ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit --local-dir /path/to/weights
+```
+
+`build-mlx.sh` compiles MLX from source only to enable the M5 neural-accelerator kernels. On M1–M4 that changes nothing, and it needs the Metal compiler (full Xcode, not Command Line Tools) — so on those machines copy Homebrew's `mlx` + `mlx-c` into `lib/mlx/{lib,include}` instead.
+
+Then point `models.toml` at the weights and the server at the binary:
+
+```toml
+[models."minimax-h3"]
+kind = "video"
+path = "/path/to/weights"
+```
+
+```bash
+export MLX_LAZYSERVE_VIDEO_BINARY=/path/to/mlx-serve/zig-out/bin/mlx-serve
+```
+
+Without the binary the `/v1/videos` routes answer 501 and nothing else changes. `ffmpeg` is required for muxing.
+
+### API
+
+Job-shaped, not request-shaped — a job outlives any reverse proxy's idle timeout:
+
+```bash
+# submit
+curl -s localhost:41434/v1/videos -H 'Content-Type: application/json' -d '{
+  "prompt": "A red cube rotating on a white table, soft studio light.",
+  "width": 768, "height": 768, "num_frames": 56, "steps": 50
+}'                                          # -> {"id":"vid_...","status":"queued"}
+
+curl -s localhost:41434/v1/videos/vid_...   # status + step progress + ETA
+curl -sO localhost:41434/v1/videos/vid_.../content   # the mp4
+curl -X DELETE localhost:41434/v1/videos/vid_...     # cancel
+```
+
+`width`/`height` must be multiples of 32. `num_frames` snaps **up** to the model's 17k+5 ladder (5, 22, 39, 56 … 362) — at 24 fps that's 0.2 s to 15.1 s. Pass `duration_seconds` instead if you'd rather think in seconds.
+
+### It shares the one slot
+
+A video job and a text model cannot both be resident: the DiT needs ~11 GB and the larger text models need up to 19 GB, against 24 GB total. So video is an occupant of the *same* single slot the text models use. Submitting a job evicts the loaded text model; while the job runs, `/v1/chat/completions` returns 503 with a `Retry-After` and the job's ETA rather than queueing behind something that may run for hours. When the queue drains, the backend is killed and the memory goes back.
+
+### Context-IR
+
+The full H3 system is three modules and only the middle one is open-weights: prompt expansion (H3-Context-IR) and 2K upscaling (H3-Regenerate-2K) stay behind MiniMax's Open Platform API. So the local ceiling is 768p, on any hardware.
+
+Expansion matters more than it sounds — H3-Base is trained on a heavily structured prompt (shot-by-shot blocking with timecodes, a separate soundscape track, a separate score track), and Context-IR is what turns one ordinary sentence into that. Set `MLX_LAZYSERVE_MINIMAX_API_KEY` and prompts get expanded before generation; without it they pass through as written. Send `"prompt_mode": "raw"` when you've written the structure yourself. If the API call fails the raw prompt is used — losing a queued multi-hour job to a remote blip would be the worse outcome.
+
+### Speed
+
+Measured on an M4 Pro (16-core GPU, 24 GB) with the 4-bit weights. Time per denoise step against sequence length, where `tokens = latent_t × (H/32) × (W/32)` and `latent_t = ((frames-5)/17)×5 + 2`:
+
+| shape | tokens | s/step |
+|---|---|---|
+| 256×256, 5f | 128 | 1.3 |
+| 512×512, 5f | 512 | 4.2 |
+| 768×768, 5f | 1152 | 9.6 |
+| 512×512, 22f | 1792 | 15.5 |
+| 768×768, 22f | 4032 | 33.2 |
+| 1344×768, 22f | 7056 | 64.0 |
+
+Those fit `t ≈ 0.56 + 7.40e-3·N + 2.23e-7·N²` seconds, within a few percent across the whole range. The linear term is the FFN and the projections; the quadratic one is attention, and past ~10k tokens it takes over. Add a fixed ~45 s per job for text encode, DiT load and VAE decode.
+
+That curve is compute only, and on 24 GB compute is not what stops you first. The DiT holds ~10.6 GB resident and the attention activations grow with N on top of it, so past a certain sequence length the box starts paging and wall-clock stops tracking the formula entirely. Measured here: 7056 tokens runs clean, 17136 tokens (1344×768, 2.3 s) drove swap from 5 GB to 11 GB and the run had to be killed.
+
+So treat the fit as a lower bound that only applies below the paging threshold, and size jobs by tokens rather than by resolution or duration alone. Watch `sysctl vm.swapusage` on the first run of any new shape: if swap grows by more than a few hundred MB, that shape does not fit, and no amount of waiting will fix it.
+
+Quantization buys footprint, not speed — the workload is compute-bound and the DiT holds ~10.6 GB either way. What quantization does buy is headroom for a longer sequence before paging, which on this box is the constraint that actually binds.
 
 ## Extras
 

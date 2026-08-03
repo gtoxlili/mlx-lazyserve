@@ -12,6 +12,24 @@
 #   tg_enable_thinking = true   Telegram-bot reasoning default (default false); a user's
 #                               /think toggle still overrides it. Independent of enable_thinking.
 
+# --- Video: MiniMax-H3 (text/image -> video + synchronized stereo audio) ---
+# Not an in-process MLX model: it runs in the mlx-serve (Zig) child process, which
+# needs ~11 GB resident for the DiT. That competes with the text models for the
+# same 24 GB, so the manager treats video as an occupant of the SAME single slot —
+# a video job evicts the loaded text model, and chat gets a 503 with an ETA until
+# the job finishes.
+#
+# kind = "video"  routes this to /v1/videos instead of /v1/chat/completions
+# path            local weights dir (40 GB — too big to pull lazily from the Hub)
+#
+# Needs MLX_LAZYSERVE_VIDEO_BINARY pointing at the built mlx-serve executable;
+# without it these routes answer 501 and nothing else changes.
+# Weights: hf download ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit (40 GB). Point `path`
+# at wherever you staged them — an external disk is fine, the backend mmaps them.
+[models."minimax-h3"]
+kind = "video"
+path = "/path/to/MiniMax-H3-FL2VA-MLX-Serve-4bit"
+
 # --- Main daily driver: comfortable on 24 GB, strongest for agent / code / text ---
 [models."gemma4-26b-uncensored"]
 # SuperGemma4 26B-A4B (MoE, ~3.8B active), uncensored, MLX 4-bit, ~14.2 GB.
