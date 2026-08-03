@@ -97,6 +97,8 @@ This one does not run in-process. The model is [MiniMax-H3](https://huggingface.
 
 Three reasons it's a subprocess rather than a binding. A job runs for minutes to hours, so IPC cost is noise. Killing the process is the only way to be certain the DiT's ~11 GB actually goes back to the OS, and on 24 GB that reclamation is the whole game. And an MLX over-commit hard-crashes the backend — as a child that's a failed job, in-process it would take the chat API down with it.
 
+> **On the box this was built on**, all of that is already done: the 38 GB of weights and the compiled backend live at `/Volumes/PRIBNOW/mlx-h3/`, and that drive has its own README with the measured numbers, the resume steps and the traps. Read it before rebuilding anything.
+
 ### Setup
 
 Build the backend and stage the weights:
