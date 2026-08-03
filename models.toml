@@ -28,7 +28,7 @@
 # at wherever you staged them — an external disk is fine, the backend mmaps them.
 [models."minimax-h3"]
 kind = "video"
-path = "/path/to/MiniMax-H3-FL2VA-MLX-Serve-4bit"
+path = "/Volumes/PRIBNOW/mlx-h3/models/MiniMax-H3-FL2VA-MLX-4bit"
 
 # --- Main daily driver: comfortable on 24 GB, strongest for agent / code / text ---
 [models."gemma4-26b-uncensored"]
