@@ -21,9 +21,9 @@ Configured in [`models.toml`](models.toml); weights download lazily into `~/.cac
 | name | repo | size |
 |---|---|---|
 | `gemma4-26b-uncensored` | `Jiunsong/supergemma4-26b-uncensored-mlx-4bit-v2` | ~14 GB |
-| `qwen3.6-35b-a3b` | `TheCluster/Qwen3.6-35B-A3B-Heretic-MLX-mixed-3.9bit` | ~19 GB |
+| `qwen3.8-27b` | `TheCluster/Qwen3.8-27B-Heretic-MLX-4bit` | ~16 GB |
 | `qwen3.5-9b` | `TheCluster/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-MLX-mxfp4` | ~5 GB |
-| `qwythos-9b` | `sahilchachra/Qwythos-9B-Claude-Mythos-5-1M-mxfp4-mlx` | ~5 GB |
+| `qwythos-9b` | `WaveCut/Qwythos-9B-v2-Heretic-MLX-4bit` | ~5 GB |
 | `cpmopus-fable5-1b` (default) | local convert of `GnLOLot/MiniCPM5-1B-Claude-Opus-Fable5-Thinking` | ~1.1 GB |
 
 Edit `models.toml` to add your own; any MLX repo on Hugging Face works.
@@ -80,7 +80,7 @@ The sampling defaults and all the Telegram bot (`MLX_LAZYSERVE_TG_*`) settings a
 
 ## Big models on 24 GB
 
-macOS caps the GPU at about 75% of unified memory (~17.8 GB on an M4 Pro). The 19 GB Qwen3.6 build needs that raised. Set `MLX_LAZYSERVE_WIRED_LIMIT_MB` (e.g. `22000`) and the service runs `sysctl iogpu.wired_limit_mb` on start and resets it on stop. That needs a one-time passwordless sudo rule scoped to just that sysctl:
+macOS caps the GPU at about 75% of unified memory (~17.8 GB on an M4 Pro). The 16 GB Qwen3.8 build plus its KV cache needs that raised. Set `MLX_LAZYSERVE_WIRED_LIMIT_MB` (e.g. `22000`) and the service runs `sysctl iogpu.wired_limit_mb` on start and resets it on stop. That needs a one-time passwordless sudo rule scoped to just that sysctl:
 
 ```bash
 sudo install -m 0440 -o root -g wheel launchd/mlx-lazyserve.sudoers /etc/sudoers.d/mlx-lazyserve

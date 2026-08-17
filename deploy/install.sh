@@ -72,6 +72,7 @@ cat > "$PLIST" <<PLIST
         <key>MLX_LAZYSERVE_TG_WEB_TOOLS</key><string>${MLX_LAZYSERVE_TG_WEB_TOOLS:-true}</string>
         <key>MLX_LAZYSERVE_FIRECRAWL_API_KEY</key><string>${MLX_LAZYSERVE_FIRECRAWL_API_KEY:-}</string>
         <key>HF_HUB_DISABLE_XET</key><string>${HF_HUB_DISABLE_XET:-1}</string>
+        <key>HF_TOKEN</key><string>${HF_TOKEN:-}</string>
     </dict>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
