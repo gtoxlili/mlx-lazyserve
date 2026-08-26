@@ -1201,8 +1201,14 @@ class TelegramBot:
             if interrupted or error or not tool_calls:
                 break
             logger.info(
+                # Arguments included on purpose: without them "round 3/3: web_search" cannot
+                # be told apart from the model re-running the same query and spinning.
                 "web tools round %d/%d: %s", step + 1, self.settings.tg_web_max_iters,
-                ", ".join((tc.get("function") or {}).get("name") or "?" for tc in tool_calls),
+                ", ".join(
+                    f"{(tc.get('function') or {}).get('name') or '?'}"
+                    f"({((tc.get('function') or {}).get('arguments') or '')[:120]})"
+                    for tc in tool_calls
+                ),
             )
             if status_mid is None:  # first tool round → show a transient "browsing" note
                 status_mid = await self._web_status(chat_id, tool_calls)
@@ -1461,7 +1467,7 @@ class TelegramBot:
             # "message is not modified" is routine (nothing new since the last edit) and is
             # not worth logging; anything else means we should slow down.
             if "not modified" not in str(exc):
-                logger.debug("stream edit rejected: %s", exc)
+                logger.info("stream edit rejected: %s", exc)
             return False
 
     async def _typing_loop(self, chat_id, stop: asyncio.Event) -> None:

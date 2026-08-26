@@ -36,14 +36,16 @@ engine = "mlx_lm"
 # Both are academic here: the wired limit binds long before either.
 # KV is cheap: only 16 of 64 layers use full attention (interval 4), and 4 KV heads x 256
 # head_dim is ~32 KiB/token at the 8-bit KV this server runs. So:
-#   128k  -> 4.0 GiB KV  + 14.2 GiB weights = 18.2 GiB, ~3.3 GiB spare
-#   192k  -> 6.0 GiB KV                     = 20.2 GiB, ~1.3 GiB spare  <- here
+#   128k  -> 4.0 GiB KV  + 14.2 GiB weights = 18.2 GiB, ~3.3 GiB spare  <- here
+#   192k  -> 6.0 GiB KV                     = 20.2 GiB, ~1.3 GiB spare
 #   256k  -> 8.0 GiB KV                     = 22.2 GiB, over the 21.5 GiB limit
-# 192k is deliberate but is the ceiling: 1.3 GiB has to cover prefill activations, and Metal
-# does not degrade when it runs out — allocation failure kills the process. Verified by
-# actually filling the window rather than by this arithmetic. Going past it means 4-bit KV,
-# which halves the per-token cost at some quality expense.
-context = 196608
+# Was briefly 192k. Backed off after watching the box under real load: swap sat at 72% of
+# 4 GiB with only 3.1 GiB of memory free, because this arithmetic only counts the model —
+# macOS, the bot and everything else live in what is left. Metal does not degrade when it
+# runs out either; allocation failure kills the process. Nothing has ever needed more than
+# 128k here, so the 2 GiB goes back to the system. Past 128k means 4-bit KV, not a bigger
+# window at 8-bit.
+context = 131072
 # Thinking ON by default on both surfaces — this is also the model's own documented default
 # ("Thinking mode is on by default and can be disabled per request"). It costs real
 # wall-clock at 14 tok/s, and <think> shares the output budget with the answer, so both
