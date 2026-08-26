@@ -49,6 +49,9 @@ LONG_POLL_TIMEOUT = 50  # seconds the getUpdates call parks server-side
 TYPING_INTERVAL = 4.0  # re-send "typing" before Telegram clears it (~5 s)
 MAX_MESSAGE_LEN = 4000  # < Telegram's 4096 hard cap (UTF-16 units), with headroom
 ACK_REACTION = "👀"  # reaction set on the triggering message while we think
+STREAM_INTERVAL = 1.0  # min seconds between edits of the live message (Telegram throttles ~1/s)
+STREAM_BACKOFF = 2.0  # multiply the interval by this after a rejected edit, up to STREAM_MAX
+STREAM_MAX_INTERVAL = 8.0
 PROMPT_MARGIN = 256  # tokens held back from the context window (template/counting slack)
 
 
@@ -870,9 +873,14 @@ class TelegramBot:
             convo = self._build_messages(chan.history, batch_msgs)
             typing_stop = asyncio.Event()
             typing = asyncio.create_task(self._typing_loop(chat_id, typing_stop))
+            stream = self._Stream(self, chat_id, reply_to)
+
+            async def on_delta(body: str, think: str) -> None:
+                await stream.push(self._compose_markdown(body, think))
+
             try:
                 text, reasoning, interrupted, error = await self._agentic_generate(
-                    chat_id, convo, abort, model, thinking
+                    chat_id, convo, abort, model, thinking, on_delta=on_delta
                 )
             finally:
                 typing_stop.set()
@@ -880,6 +888,9 @@ class TelegramBot:
                 chan.abort = None
 
             if interrupted:
+                # The batch is regenerated from scratch, so the half-written live message
+                # would otherwise linger next to the real answer.
+                await stream.drop()
                 if self._closing:
                     chan.worker = None
                     return
@@ -891,9 +902,11 @@ class TelegramBot:
             await self._react(chat_id, reply_to, None)
             reacted = None
             if error:
+                await stream.drop()
                 await self._send_plain(chat_id, f"⚠️ 生成失败：{error}", reply_to)
                 continue
             if not text.strip():
+                await stream.drop()
                 await self._send_plain(chat_id, "（模型返回了空回复）", reply_to)
                 continue
 
@@ -907,6 +920,7 @@ class TelegramBot:
             chan.history.extend(turn)
             self._trim_history(chan)
             await self._persist(chat_id, user_id, turn)
+            await stream.drop()  # the fully rendered send below replaces it
             await self._send_reply(chat_id, text, reasoning, reply_to)
 
     def _compose_turn(self, msg: Incoming, chan: Channel) -> str:
@@ -985,7 +999,7 @@ class TelegramBot:
 
     async def _generate(
         self, messages: list[dict], abort: threading.Event, model: str,
-        enable_thinking: bool, tools: list | None = None,
+        enable_thinking: bool, tools: list | None = None, on_delta=None,
     ):
         """Run the blocking model stream in a thread, bridging events over a queue.
 
@@ -1063,7 +1077,12 @@ class TelegramBot:
                     reasoning.append(value["reasoning"])
                 elif value.get("tool_calls"):
                     tool_calls.extend(value["tool_calls"])
-                # usage is not surfaced in the chat bot
+                else:
+                    continue  # usage and friends — nothing new to show
+                if on_delta is not None:
+                    # Awaited inline, but the edit is throttled inside push(), so this is one
+                    # HTTP round trip per interval rather than one per token.
+                    await on_delta("".join(content), "".join(reasoning))
         finally:
             producer_stop.set()  # stop the producer WITHOUT poisoning the shared `abort`
             await asyncio.gather(producer, return_exceptions=True)
@@ -1369,6 +1388,80 @@ class TelegramBot:
         await self._api_quiet(
             "setMessageReaction", chat_id=chat_id, message_id=message_id, reaction=reaction
         )
+
+    class _Stream:
+        """Owns one Telegram message and rewrites it as tokens arrive.
+
+        Telegram has no streaming API, so "streaming" here is one message edited repeatedly,
+        and edits to a single message are rate-limited — hence the interval, and the backoff
+        that widens it whenever Telegram refuses one. Content goes through telegramify on
+        every edit rather than being sent as plain text: it escapes an unclosed ``**`` instead
+        of failing and auto-closes a dangling code fence, so half-written Markdown is safe.
+        """
+
+        def __init__(self, bot, chat_id: int, reply_to: int) -> None:
+            self.bot, self.chat_id, self.reply_to = bot, chat_id, reply_to
+            self.mid: int | None = None
+            self.interval = STREAM_INTERVAL
+            self.last = 0.0
+            self.shown = ""
+            self.overflow = False  # outgrew one message; the final send takes over
+
+        async def push(self, text: str) -> None:
+            text = text.strip()
+            if not text or self.overflow or text == self.shown:
+                return
+            if len(text) > MAX_MESSAGE_LEN:
+                self.overflow = True
+                return
+            now = time.monotonic()
+            if self.mid is not None and now - self.last < self.interval:
+                return
+            self.last = now
+            if self.mid is None:
+                sent = await self.bot._api_quiet(
+                    "sendMessage", chat_id=self.chat_id, text=text,
+                    reply_parameters={"message_id": self.reply_to,
+                                      "allow_sending_without_reply": True},
+                    link_preview_options={"is_disabled": True},
+                )
+                self.mid = (sent or {}).get("message_id")
+            elif not await self.bot._stream_edit(self.chat_id, self.mid, text):
+                self.interval = min(self.interval * STREAM_BACKOFF, STREAM_MAX_INTERVAL)
+                return
+            self.shown = text
+
+        async def drop(self) -> None:
+            """Remove the live message, for when the final render replaces it."""
+            if self.mid is not None:
+                await self.bot._api_quiet("deleteMessage", chat_id=self.chat_id,
+                                          message_id=self.mid)
+                self.mid = None
+
+    async def _stream_edit(self, chat_id: int, mid: int, text: str) -> bool:
+        """Rewrite the live message. Returns False when Telegram refused the edit."""
+        from telegramify_markdown import markdownify
+
+        try:
+            body = markdownify(text)
+        except Exception:  # a half-written table can still confuse the converter
+            body = text
+        try:
+            await self._api(
+                "editMessageText",
+                chat_id=chat_id,
+                message_id=mid,
+                text=body,
+                parse_mode="MarkdownV2",
+                link_preview_options={"is_disabled": True},
+            )
+            return True
+        except Exception as exc:
+            # "message is not modified" is routine (nothing new since the last edit) and is
+            # not worth logging; anything else means we should slow down.
+            if "not modified" not in str(exc):
+                logger.debug("stream edit rejected: %s", exc)
+            return False
 
     async def _typing_loop(self, chat_id, stop: asyncio.Event) -> None:
         while not stop.is_set():

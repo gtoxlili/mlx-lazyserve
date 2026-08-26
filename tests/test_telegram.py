@@ -251,3 +251,82 @@ class ToolAvailabilityTests(unittest.TestCase):
 
     def test_disabling_the_group_log_removes_the_tool(self):
         self.assertIsNone(self.make(cap=0, fc=None)._tools_for(-1001))
+
+
+class StreamTests(unittest.IsolatedAsyncioTestCase):
+    """Telegram has no streaming API — this is one message edited on a throttle, so the
+    throttle and the backoff are the whole mechanism."""
+
+    def make(self):
+        from mlx_lazyserve.telegram import TelegramBot
+        b = bot()
+        self.calls = []
+
+        async def api_quiet(method, **kw):
+            self.calls.append((method, kw))
+            return {"message_id": 7}
+
+        async def stream_edit(chat_id, mid, text):
+            self.calls.append(("edit", {"text": text}))
+            return self.edit_ok
+
+        b._api_quiet = api_quiet
+        b._stream_edit = stream_edit
+        self.edit_ok = True
+        return TelegramBot._Stream(b, -100, 5)
+
+    async def test_the_first_push_sends_a_message(self):
+        st = self.make()
+        await st.push("你好")
+        self.assertEqual(self.calls[0][0], "sendMessage")
+        self.assertEqual(st.mid, 7)
+
+    async def test_edits_inside_the_interval_are_skipped(self):
+        st = self.make()
+        await st.push("一")
+        await st.push("一二")          # immediately after — throttled away
+        self.assertEqual([c[0] for c in self.calls], ["sendMessage"])
+
+    async def test_an_edit_lands_once_the_interval_has_passed(self):
+        st = self.make()
+        await st.push("一")
+        st.last = 0.0                  # pretend the interval elapsed
+        await st.push("一二")
+        self.assertEqual(self.calls[-1], ("edit", {"text": "一二"}))
+
+    async def test_identical_text_never_costs_a_request(self):
+        st = self.make()
+        await st.push("一")
+        st.last = 0.0
+        await st.push("一")
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_a_refused_edit_widens_the_interval(self):
+        st = self.make()
+        await st.push("一")
+        st.last = 0.0
+        self.edit_ok = False
+        before = st.interval
+        await st.push("一二")
+        self.assertGreater(st.interval, before)
+        self.assertEqual(st.shown, "一")   # not recorded as shown, so it retries later
+
+    async def test_outgrowing_one_message_stops_streaming(self):
+        # Past Telegram's per-message limit the live preview gives up and the final,
+        # properly split send takes over.
+        st = self.make()
+        await st.push("x" * 9000)
+        self.assertTrue(st.overflow)
+        self.assertEqual(self.calls, [])
+
+    async def test_drop_deletes_the_live_message(self):
+        st = self.make()
+        await st.push("一")
+        await st.drop()
+        self.assertEqual(self.calls[-1][0], "deleteMessage")
+        self.assertIsNone(st.mid)
+
+    async def test_drop_without_a_message_is_a_no_op(self):
+        st = self.make()
+        await st.drop()
+        self.assertEqual(self.calls, [])
