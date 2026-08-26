@@ -69,6 +69,7 @@ class Incoming:
     user_id: int
     message_id: int
     text: str
+    quoted: str | None = None  # the message this one replies to, rendered for the model
 
 
 @dataclass
@@ -425,7 +426,7 @@ class TelegramBot:
                 ))
             return
         if text:
-            self.submit(Incoming(chat_id, user_id, mid, text))
+            self.submit(Incoming(chat_id, user_id, mid, text, self._quoted_context(message)))
 
     def _dm_authorized(self, user_id: int) -> bool:
         if not self.settings.tg_owner_ids:
@@ -506,7 +507,52 @@ class TelegramBot:
             return None
 
         clean = self._strip_mention(text) or text
-        return Incoming(chat_id=chat_id, user_id=user_id, message_id=message["message_id"], text=clean)
+        return Incoming(
+            chat_id=chat_id,
+            user_id=user_id,
+            message_id=message["message_id"],
+            text=clean,
+            quoted=self._quoted_context(message),
+        )
+
+    QUOTE_CHARS = 4000  # a quoted wall of text should not crowd out the actual question
+    SELF_QUOTE = "[引用 · 你自己之前说]"
+
+    def _quoted_context(self, message: dict) -> str | None:
+        """Render whatever this message is replying to, so the model can see what is meant.
+
+        In a group "@bot 这条什么意思" only makes sense together with the message it points
+        at, and Telegram delivers that separately from the user's own text — without this it
+        never reaches the model at all. A hand-selected ``quote`` wins over the full message:
+        picking part of a message is a deliberate narrowing of what is being asked about.
+        """
+        target = message.get("reply_to_message")
+        picked = (message.get("quote") or {}).get("text")
+        if not target and not picked:
+            return None
+
+        body = picked or (target or {}).get("text") or (target or {}).get("caption") or ""
+        body = body.strip()
+        if not body:
+            # Media with no caption still tells the model something was pointed at, which
+            # beats silently answering as if the user had referenced nothing.
+            kind = next(
+                (k for k in ("photo", "video", "document", "audio", "voice", "sticker",
+                             "animation", "poll", "location") if (target or {}).get(k)),
+                None,
+            )
+            if not kind:
+                return None
+            body = f"[{kind}]"
+        if len(body) > self.QUOTE_CHARS:
+            body = body[: self.QUOTE_CHARS] + "…（已截断）"
+
+        frm = (target or {}).get("from") or {}
+        if frm.get("id") == self.bot_id:
+            return f"{self.SELF_QUOTE}\n{body}"
+        name = ((frm.get("first_name") or "") + " " + (frm.get("last_name") or "")).strip()
+        who = name or frm.get("username") or "某人"
+        return f"[引用 · {who} 说]\n{body}"
 
     def _strip_mention(self, text: str) -> str:
         if not self.username:
@@ -682,7 +728,9 @@ class TelegramBot:
 
             # Each Telegram message stays its own native user turn (no string concatenation);
             # a merged batch is simply several consecutive user messages in the request.
-            batch_msgs = [{"role": "user", "content": m.text} for m in batch if m.text]
+            batch_msgs = [
+                {"role": "user", "content": self._compose_turn(m, chan)} for m in batch if m.text
+            ]
             reply_to = batch[-1].message_id
             if not batch_msgs:
                 continue
@@ -746,6 +794,23 @@ class TelegramBot:
             self._trim_history(chan)
             await self._persist(chat_id, user_id, turn)
             await self._send_reply(chat_id, text, reasoning, reply_to)
+
+    def _compose_turn(self, msg: Incoming, chan: Channel) -> str:
+        """The user's text, prefixed by whatever message it was replying to."""
+        quoted = msg.quoted
+        if not quoted:
+            return msg.text
+        if quoted.startswith(self.SELF_QUOTE):
+            # Replying to the bot is just how you continue a thread in a group, and that text
+            # is already the previous assistant turn. Re-quoting it back would pay for the
+            # same tokens twice on a path where prefill is the bottleneck.
+            last = next(
+                (h.get("content") or "" for h in reversed(chan.history)
+                 if h.get("role") == "assistant"), ""
+            ).strip()
+            if last and last[:200] in quoted:
+                return msg.text
+        return f"{quoted}\n\n{msg.text}"
 
     def _build_messages(self, history: list[dict], new_msgs: list[dict]) -> list[dict]:
         messages: list[dict] = []
