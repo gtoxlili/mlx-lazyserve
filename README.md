@@ -20,11 +20,7 @@ Configured in [`models.toml`](models.toml); weights download lazily into `~/.cac
 
 | name | repo | size |
 |---|---|---|
-| `gemma4-26b-uncensored` | `Jiunsong/supergemma4-26b-uncensored-mlx-4bit-v2` | ~14 GB |
-| `qwen3.8-27b` | `TheCluster/Qwen3.8-27B-Heretic-MLX-4bit` | ~16 GB |
-| `qwen3.5-9b` | `TheCluster/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-MLX-mxfp4` | ~5 GB |
-| `qwythos-9b` | `WaveCut/Qwythos-9B-v2-Heretic-MLX-4bit` | ~5 GB |
-| `cpmopus-fable5-1b` (default) | local convert of `GnLOLot/MiniCPM5-1B-Claude-Opus-Fable5-Thinking` | ~1.1 GB |
+| `qwen3.8-27b` (default) | `TheCluster/Qwen3.8-27B-Heretic-MLX-4bit` | ~16 GB |
 
 Edit `models.toml` to add your own; any MLX repo on Hugging Face works.
 
@@ -45,7 +41,7 @@ The first request for a model downloads and loads it (slow); after that it stays
 ```bash
 curl http://localhost:41434/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.5-9b","messages":[{"role":"user","content":"hi"}],"stream":true}'
+  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
 If `MLX_LAZYSERVE_API_KEYS` is set, add `-H 'Authorization: Bearer <key>'`.
@@ -92,7 +88,7 @@ Without the rule the service still runs on the default cap (it just logs a warni
 
 - **Reverse proxy**: [`deploy/nginx/mlx-lazyserve.conf`](deploy/nginx/mlx-lazyserve.conf) is an SSE-friendly nginx vhost (Cloudflare → nginx → Tailscale). Edit `server_name` and the upstream host for your setup.
 - **Maintenance mode**: `POST /admin/maintenance {"enabled":true}` unloads the model and returns 503 for inference, for when a scheduled job needs the GPU/RAM back; `{"enabled":false}` resumes.
-- **Telegram bot**: set `MLX_LAZYSERVE_TG_BOT_TOKEN` (from [@BotFather](https://t.me/BotFather)) and `uv sync --extra telegram`. It answers @mentions and replies in groups, keeps a short per-user history in SQLite, and lets each user pick a model (`/model`) and toggle reasoning (`/think`). It can also **search the web and read pages/PDFs** on demand via [Firecrawl](https://firecrawl.dev) — keyless by default (set `MLX_LAZYSERVE_FIRECRAWL_API_KEY` for higher limits, or `MLX_LAZYSERVE_TG_WEB_TOOLS=false` to turn it off). `MLX_LAZYSERVE_TG_OWNER_IDS` gates who can add it to a group or DM it. All `TG_*` options are in [`service.env.example`](deploy/service.env.example).
+- **Telegram bot**: set `MLX_LAZYSERVE_TG_BOT_TOKEN` (from [@BotFather](https://t.me/BotFather)) and `uv sync --extra telegram`. It answers @mentions and replies in groups, keeps a short per-user history in SQLite, and lets each user toggle reasoning (`/think`). It can also **search the web and read pages/PDFs** on demand via [Firecrawl](https://firecrawl.dev) — keyless by default (set `MLX_LAZYSERVE_FIRECRAWL_API_KEY` for higher limits, or `MLX_LAZYSERVE_TG_WEB_TOOLS=false` to turn it off). `MLX_LAZYSERVE_TG_OWNER_IDS` gates who can add it to a group or DM it. All `TG_*` options are in [`service.env.example`](deploy/service.env.example).
 
 ## Downloads from mainland China
 

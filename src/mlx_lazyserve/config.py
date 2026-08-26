@@ -12,7 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 @dataclass(frozen=True)
 class ModelSpec:
-    name: str  # friendly id exposed over the API, e.g. "qwen3.5-9b"
+    name: str  # friendly id exposed over the API, e.g. "qwen3.8-27b"
     repo: str  # Hugging Face MLX repo id
     engine: str = "auto"  # "auto" | "mlx_lm" | "mlx_vlm"
     default: bool = False
@@ -30,6 +30,8 @@ class Settings:
     default_kv_bits: int  # if > 0, quantize the KV cache to N bits (saves memory)
     default_repetition_penalty: float  # default penalty applied when a request omits it
     default_min_p: float  # default min-p sampling floor for the API (0 = off)
+    default_temperature: float  # sampling temperature when a request omits it
+    default_top_k: int  # top-k when a request omits it (0 = off / full vocab)
     repetition_context_size: int  # tokens the repetition penalty looks back over
     loop_guard: bool  # stop generation if the output degenerates into a repeat loop
     wired_limit_mb: int  # if > 0, raise iogpu.wired_limit_mb on start, reset to 0 on stop
@@ -45,6 +47,8 @@ class Settings:
     tg_kv_bits: int  # KV-cache quantization for bot generation (e.g. 4); 0 = unquantized
     tg_repetition_penalty: float  # repetition penalty for bot replies (curbs loops)
     tg_min_p: float  # min-p sampling floor for bot replies
+    tg_temperature: float  # sampling temperature for bot replies
+    tg_top_k: int  # top-k for bot replies (0 = off / full vocab)
     tg_history_turns: int  # per-(chat,user) (user,assistant) pairs kept as context
     tg_db_path: Path  # SQLite file persisting per-(chat,user) conversation history
     tg_owner_ids: tuple[int, ...]  # user ids allowed to add the bot to a group; empty = anyone
@@ -160,6 +164,8 @@ def load_settings() -> Settings:
         default_kv_bits=int(os.environ.get("MLX_LAZYSERVE_KV_BITS", "0")),
         default_repetition_penalty=_float_env("MLX_LAZYSERVE_REPETITION_PENALTY", 1.1),
         default_min_p=_float_env("MLX_LAZYSERVE_MIN_P", 0.0),
+        default_temperature=_float_env("MLX_LAZYSERVE_TEMPERATURE", 0.7),
+        default_top_k=_int_env("MLX_LAZYSERVE_TOP_K", 0),
         repetition_context_size=_int_env("MLX_LAZYSERVE_REPETITION_CONTEXT", 64),
         loop_guard=_bool_env("MLX_LAZYSERVE_LOOP_GUARD", True),
         wired_limit_mb=int(os.environ.get("MLX_LAZYSERVE_WIRED_LIMIT_MB", "0")),
@@ -182,6 +188,10 @@ def load_settings() -> Settings:
             _float_env("MLX_LAZYSERVE_REPETITION_PENALTY", 1.1),
         ),
         tg_min_p=_float_env("MLX_LAZYSERVE_TG_MIN_P", 0.05),
+        tg_temperature=_float_env(
+            "MLX_LAZYSERVE_TG_TEMPERATURE", _float_env("MLX_LAZYSERVE_TEMPERATURE", 0.7)
+        ),
+        tg_top_k=_int_env("MLX_LAZYSERVE_TG_TOP_K", _int_env("MLX_LAZYSERVE_TOP_K", 0)),
         tg_history_turns=_int_env("MLX_LAZYSERVE_TG_HISTORY_TURNS", 8),
         tg_db_path=tg_db_path,
         tg_owner_ids=tg_owner_ids,

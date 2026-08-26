@@ -336,6 +336,104 @@ def _loop_guarded(raw_iter: Iterator[str]) -> Iterator[str]:
     _close(raw_iter)
 
 
+CONTEXT_MARGIN = 256  # tokens held back from the window (chat-template / counting slack)
+
+
+class _PrefixCache:
+    """Reuse KV state between requests whose prompts share a token prefix.
+
+    Prefill is compute-bound and slow for a big dense model (~100 tok/s for a 27B on an
+    M4 Pro, against ~14 tok/s to decode), and a stateless server re-prefills the whole
+    conversation every turn. Keeping the cache turns turn N+1's prefill into just the
+    tokens that are actually new.
+
+    Only an EXACT prefix can be reused. Models here mix linear-attention layers, whose
+    cache is a fixed-size recurrent state (``ArraysCache``), with real ``KVCache`` ones,
+    and ``can_trim_prompt_cache`` is False for that mix — there is no way to roll the
+    recurrent half back a few tokens, so a prompt that diverges anywhere inside the
+    cached span has to start over. Reuse is likewise only sound while the KV
+    quantization is unchanged, since ``generate_step`` quantizes the cache in place.
+
+    Not thread-safe by design: ``ModelManager`` serializes generation behind its lock,
+    and the cache dies with the model on idle-unload.
+    """
+
+    MIN_REUSE = 256  # under this the prefill saved is worth less than the risk of a stale hit
+
+    def __init__(self) -> None:
+        self.drop()
+
+    def drop(self) -> None:
+        """Forget everything — used whenever the cache's contents become unknowable."""
+        self.cache = None
+        self.tokens: list[int] = []
+        self.sig: tuple | None = None
+
+    def fresh(self, model, sig: tuple):
+        from mlx_lm.models.cache import make_prompt_cache
+
+        self.drop()
+        self.sig = sig
+        self.cache = make_prompt_cache(model)
+        return self.cache
+
+    def reuse(self, model, prompt_ids: list[int], sig: tuple):
+        """Return ``(cache, tokens_to_prefill)``, reusing the live cache when it fits."""
+        n = len(self.tokens)
+        if (
+            self.cache is not None
+            and sig == self.sig
+            and n >= self.MIN_REUSE
+            and n < len(prompt_ids)  # strictly, so there is always a token left to feed
+            and self.tokens == prompt_ids[:n]
+        ):
+            logger.info(
+                "prompt cache hit: %d of %d prompt tokens already resident (%d to prefill)",
+                n, len(prompt_ids), len(prompt_ids) - n,
+            )
+            return self.cache, list(prompt_ids[n:])
+        return self.fresh(model, sig), list(prompt_ids)
+
+    def commit(self, prompt_ids: list[int], generated: list[int]) -> None:
+        """Record what the cache now holds: the whole prompt plus what was generated."""
+        if self.cache is not None:
+            self.tokens = list(prompt_ids) + list(generated)
+
+
+class ContextOverflow(ValueError):
+    """The prompt alone fills the context window, so there is no room left to answer."""
+
+
+def _fit_output(gen_kw, prompt_tokens, context):
+    """Shrink ``max_tokens`` so prompt + output stay inside the model's context window.
+
+    Nothing upstream bounds that pair: ``max_tokens`` arrives straight from the request (or
+    the server default, which is the whole window), while the KV cache grows with prompt AND
+    output. Left alone an oversized pair walks the cache past ``iogpu.wired_limit_mb``, where
+    Metal fails hard instead of degrading. Returns ``gen_kw`` untouched when it already fits,
+    so a short prompt still gets the full window to answer in.
+    """
+    if not context:
+        return gen_kw
+    room = context - prompt_tokens - CONTEXT_MARGIN
+    if room <= 0:
+        # _fit_prompt drops the oldest non-system messages, but it always keeps the newest
+        # one — so a single oversized message arrives here untrimmed. Refuse it rather than
+        # hand it to prefill, where the KV for a multi-hundred-k prompt blows past the wired
+        # limit and Metal dies outright.
+        raise ContextOverflow(
+            f"prompt is {prompt_tokens} tokens; this model's context window is {context}, "
+            f"leaving no room to generate. Shorten the input or split the request."
+        )
+    if room >= gen_kw["max_tokens"]:
+        return gen_kw
+    logger.info(
+        "clamping max_tokens %d -> %d (prompt %d + output must fit context %d)",
+        gen_kw["max_tokens"], max(1, room), prompt_tokens, context,
+    )
+    return {**gen_kw, "max_tokens": max(1, room)}
+
+
 def _fit_prompt(messages, build, token_len, max_prompt_tokens):
     """Drop the oldest non-system messages until the built prompt fits ``max_prompt_tokens``.
 
@@ -504,15 +602,20 @@ def _capture_usage(chunk, usage: dict) -> None:
 
 
 def _usage_event(usage: dict):
-    """An OpenAI usage object wrapped as a typed event, or None if no counts captured."""
+    """An OpenAI usage object wrapped as a typed event, or None if no counts captured.
+
+    ``prompt_tokens`` reports the WHOLE prompt, not just what was prefilled. On a prompt
+    cache hit stream_generate only ever sees the un-cached suffix and counts that, which
+    would under-report the prompt by orders of magnitude to an OpenAI client.
+    """
     if not usage:
         return None
-    p = int(usage.get("prompt_tokens", 0))
+    p = int(usage.get("true_prompt_tokens") or usage.get("prompt_tokens", 0))
     c = int(usage.get("completion_tokens", 0))
     return {"usage": {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}}
 
 
-def _raw_with_kv_fallback(make_gen, gen_kw, usage) -> Iterator[str]:
+def _raw_with_kv_fallback(make_gen, gen_kw, usage, tokens_out=None) -> Iterator[str]:
     """Iterate a stream_generate, yielding ``.text`` deltas and recording token counts.
 
     If KV-cache quantization isn't supported for this model — e.g. Gemma's
@@ -521,9 +624,11 @@ def _raw_with_kv_fallback(make_gen, gen_kw, usage) -> Iterator[str]:
     """
     produced = False
     try:
-        for chunk in make_gen(gen_kw):
+        for chunk in make_gen(gen_kw, False):
             produced = True
             _capture_usage(chunk, usage)
+            if tokens_out is not None and getattr(chunk, "token", None) is not None:
+                tokens_out.append(int(chunk.token))
             t = getattr(chunk, "text", None)
             yield t if t is not None else str(chunk)
     except NotImplementedError as exc:
@@ -531,8 +636,14 @@ def _raw_with_kv_fallback(make_gen, gen_kw, usage) -> Iterator[str]:
             raise
         logger.warning("kv_bits unsupported for this model (%s); retrying unquantized", exc)
         kw = {k: v for k, v in gen_kw.items() if k != "kv_bits"}
-        for chunk in make_gen(kw):
+        if tokens_out is not None:
+            tokens_out.clear()
+        # fresh=True: the failed attempt already prefilled into whatever cache it was
+        # handed, so the retry must start from a clean one.
+        for chunk in make_gen(kw, True):
             _capture_usage(chunk, usage)
+            if tokens_out is not None and getattr(chunk, "token", None) is not None:
+                tokens_out.append(int(chunk.token))
             t = getattr(chunk, "text", None)
             yield t if t is not None else str(chunk)
 
@@ -545,6 +656,7 @@ class MlxLmModel:
 
         self.repo = repo
         self.model, self.tokenizer = load(repo)
+        self._prefix = _PrefixCache()
         hf_tok = getattr(self.tokenizer, "_tokenizer", self.tokenizer)
         self._blocked_token_ids = _fim_token_ids(hf_tok)
         if self._blocked_token_ids:
@@ -605,6 +717,7 @@ class MlxLmModel:
         kv_bits=0,
         loop_guard=True,
         max_prompt_tokens=None,
+        context=0,
     ) -> Iterator[dict]:
         if images:
             raise ValueError(
@@ -642,15 +755,45 @@ class MlxLmModel:
                 self._prompt_token_len,
                 max_prompt_tokens,
             )
+            run_kw = _fit_output(gen_kw, self._prompt_token_len(prompt), context)
             _apply_seed(seed)
             usage: dict = {}
+            # Only token-id prompts can be prefix-matched; a templated string would have to
+            # be re-encoded to compare, and that round-trip is not guaranteed faithful.
+            ids = prompt if isinstance(prompt, list) and prompt and isinstance(prompt[0], int) else None
+            sig = (int(kv_bits or 0),)
+
+            def make_gen(kw, fresh):
+                if ids is None:
+                    return stream_generate(self.model, self.tokenizer, prompt, **kw)
+                cache, feed = (
+                    (self._prefix.fresh(self.model, sig), list(ids))
+                    if fresh
+                    else self._prefix.reuse(self.model, ids, sig)
+                )
+                return stream_generate(
+                    self.model, self.tokenizer, feed, **{**kw, "prompt_cache": cache}
+                )
+
+            if ids is not None:
+                usage["true_prompt_tokens"] = len(ids)
 
             def raw():
-                yield from _raw_with_kv_fallback(
-                    lambda kw: stream_generate(self.model, self.tokenizer, prompt, **kw),
-                    gen_kw,
-                    usage,
-                )
+                produced: list[int] = []
+                complete = False
+                try:
+                    yield from _raw_with_kv_fallback(make_gen, run_kw, usage, produced)
+                    complete = True
+                finally:
+                    if ids is not None:
+                        # Only keep the cache when the stream ran to its natural end. An abort
+                        # or a loop-guard truncation can leave tokens in the cache that never
+                        # reached `produced`, and a cache we can't describe exactly is a cache
+                        # that would silently corrupt the next reuse.
+                        if complete:
+                            self._prefix.commit(ids, produced)
+                        else:
+                            self._prefix.drop()
 
             clean = _without_fim_markers(raw())
             guarded = _loop_guarded(clean) if loop_guard else clean
@@ -768,6 +911,7 @@ class MlxVlmModel:
         kv_bits=0,
         loop_guard=True,
         max_prompt_tokens=None,
+        context=0,
     ) -> Iterator[dict]:
         from mlx_vlm import stream_generate
 
@@ -807,13 +951,14 @@ class MlxVlmModel:
                 self._prompt_token_len,
                 max_prompt_tokens,
             )
+            run_kw = _fit_output(gen_kw, self._prompt_token_len(prompt), context)
             _apply_seed(seed)
             usage: dict = {}
 
             def raw():
                 yield from _raw_with_kv_fallback(
-                    lambda kw: stream_generate(self.model, self.processor, prompt, **kw),
-                    gen_kw,
+                    lambda kw, fresh: stream_generate(self.model, self.processor, prompt, **kw),
+                    run_kw,
                     usage,
                 )
 

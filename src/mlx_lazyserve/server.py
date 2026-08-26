@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .config import load_settings
+from .engine import CONTEXT_MARGIN, ContextOverflow
 from .manager import ModelManager
 
 logging.basicConfig(
@@ -96,7 +97,7 @@ def _params(body: dict) -> dict:
             or body.get("max_completion_tokens")
             or settings.default_max_tokens
         ),
-        "temperature": float(body.get("temperature", 0.7)),
+        "temperature": float(body.get("temperature", settings.default_temperature)),
         "top_p": float(body.get("top_p", 0.95)),
         "kv_bits": int(body.get("kv_bits", settings.default_kv_bits) or 0),
         # Anti-repetition defaults (Ollama-style). Clients may override both — send
@@ -108,8 +109,11 @@ def _params(body: dict) -> dict:
         "min_p": float(body.get("min_p", settings.default_min_p)),
         "loop_guard": bool(body.get("loop_guard", settings.loop_guard)),
     }
-    if body.get("top_k") is not None:
-        p["top_k"] = int(body["top_k"])
+    top_k = body.get("top_k")
+    if top_k is None:
+        top_k = settings.default_top_k or None
+    if top_k is not None:
+        p["top_k"] = int(top_k)
     if body.get("seed") is not None:
         p["seed"] = int(body["seed"])
     if body.get("presence_penalty") is not None:
@@ -122,6 +126,27 @@ def _params(body: dict) -> dict:
     if stop:
         p["stop"] = [stop] if isinstance(stop, str) else [s for s in stop if s]
     return p
+
+
+def _apply_context_budget(model: str, params: dict) -> None:
+    """Bound prompt + output by the model's context window.
+
+    Without this nothing caps the pair: ``max_tokens`` comes straight from the request (or
+    the server default, which is the whole window) and the prompt is whatever was posted, so
+    a large pair grows the KV cache past ``iogpu.wired_limit_mb`` and Metal fails hard. The
+    engine does the actual work — it trims the prompt to ``max_prompt_tokens`` (oldest
+    non-system messages first) and then clamps ``max_tokens`` against the fitted prompt's
+    real token count. Reserving at most half the window here mirrors the Telegram path; a
+    short prompt still gets nearly the whole window to answer in, since the engine-side
+    clamp only bites when the pair would actually overflow.
+    """
+    spec = settings.models.get(model)
+    context = spec.context if spec else 0
+    if not context:
+        return
+    params["context"] = context
+    reserve = min(int(params["max_tokens"]), max(256, context // 2))
+    params["max_prompt_tokens"] = max(1024, context - reserve - CONTEXT_MARGIN)
 
 
 def _resolve_tools(body: dict):
@@ -185,6 +210,16 @@ def _chunk(cid: str, created: int, model: str, delta: dict, finish=None) -> str:
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
     }
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+@app.exception_handler(ContextOverflow)
+async def _context_overflow_handler(request: Request, exc: ContextOverflow):
+    """413 rather than a 500 traceback (or an OOM) when the prompt can't fit the window."""
+    return JSONResponse(
+        status_code=413,
+        content={"error": {"message": str(exc), "type": "invalid_request_error",
+                           "code": "context_length_exceeded"}},
+    )
 
 
 def _maintenance_response() -> JSONResponse:
@@ -336,6 +371,7 @@ async def chat_completions(request: Request):
             status_code=400, detail="response_format and tools cannot be used together"
         )
     params = _params(body)
+    _apply_context_budget(model, params)
     params["images"] = images
     params["tools"] = tools
     # structured output emits JSON directly — incompatible with free-form <think> reasoning

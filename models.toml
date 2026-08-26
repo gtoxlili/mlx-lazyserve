@@ -12,70 +12,33 @@
 #   tg_enable_thinking = true   Telegram-bot reasoning default (default false); a user's
 #                               /think toggle still overrides it. Independent of enable_thinking.
 
-# --- Main daily driver: comfortable on 24 GB, strongest for agent / code / text ---
-[models."gemma4-26b-uncensored"]
-# SuperGemma4 26B-A4B (MoE, ~3.8B active), uncensored, MLX 4-bit, ~14.2 GB.
-# Text-only build (best benchmarks), tuned for Apple Silicon.
-repo = "Jiunsong/supergemma4-26b-uncensored-mlx-4bit-v2"
-engine = "auto"
-# 256k-capable. Sliding-window attention (25 of 30 layers, window 1024) keeps KV cheap —
-# only 5 full-attn layers grow with context — so ~96k fits 24 GB (~4 GB KV) with margin.
-context = 98304
-
-# --- Main heavy hitter: needs the raised iogpu.wired_limit_mb (~22000) ---
+# --- The one model. Sized to own the whole 24 GiB box; needs iogpu.wired_limit_mb=22000 ---
 [models."qwen3.8-27b"]
-# Qwen 3.8 27B (dense), "Heretic" abliteration, MLX 4-bit, ~16.1 GB. Same publisher and same
-# abliteration as the Qwen3.6-35B-A3B this replaces. Mind the trade: 3.8 ships no MoE at this
-# size (the lineup is just 27B and 2.4T-A95B), so every token activates all 27B params instead
-# of the old build's ~3B — stronger per token, visibly slower to emit them.
-# The idle-unload frees the ~16 GB when not in use.
+# Qwen 3.8 27B (dense), "Heretic" abliteration, MLX 4-bit, ~15 GiB on disk.
+# Dense, so every token activates all 27B params: ~14 tok/s on an M4 Pro (16 GPU cores).
+# The idle-unload frees the ~19 GiB working set when not in use, which is most of this
+# 24 GiB box — that reclaim is the whole point of the lazy-load design.
 repo = "TheCluster/Qwen3.8-27B-Heretic-MLX-4bit"
-# The build ships the vision + video preprocessors, so this is the one multimodal entry here:
-# "auto" takes mlx-lm's text path when it loads, else falls back to mlx-vlm. Force "mlx_vlm"
-# if you want image input to actually work.
-engine = "auto"
-# 256k-capable (max_position_embeddings 262144). KV is cheap: only 16 of 64 layers use full
-# attention (interval 4), and 4 KV heads x 256 head_dim is ~32 KiB/token at the 8-bit KV prod
-# runs — so 96k costs ~3 GiB, and 15 GiB weights + 3 GiB KV sits well inside the 22000 MB wired
-# limit. This ceiling assumes 8-bit KV stays on; unquantized KV doubles it.
-context = 98304
-
-# --- Lightweight fallback: ~5 GB, always loads, fast, leaves headroom ---
-[models."qwen3.5-9b"]
-# HauhauCS Aggressive uncensored, community MLX conversion (mxfp4).
-repo = "TheCluster/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-MLX-mxfp4"
-engine = "auto"
-# 256k-capable; only ~5 GB of weights leaves lots of room. With 8-bit KV, 128k ≈ 8.6 GB KV
-# fits comfortably (could push ~192k).
-context = 131072
-
-# --- Qwythos v2 reasoning tune, Heretic-abliterated: text-only 4-bit MLX, ~5.1 GB ---
-[models."qwythos-9b"]
-# WaveCut's Heretic abliteration of empero-ai/Qwythos-9B-v2, converted to 4-bit MLX (affine,
-# group 64). Supersedes the v1 Claude-Mythos-5-1M build and adds the abliteration it lacked;
-# the friendly name stays "qwythos-9b" so existing clients keep working.
-# Architecture is identical to v1 — 32 layers, only 8 of them full attention — so KV still
-# grows slowly. Bot default is 4-bit KV: 512k ≈ 4 GiB KV; 1M (the model's real
-# max_position_embeddings) fits on paper but makes huge-paste prefill too easy to trigger.
-repo = "WaveCut/Qwythos-9B-v2-Heretic-MLX-4bit"
-engine = "mlx_lm"
-context = 524288
-
-# --- Default small Fable coder/agent model: MiniCPM5-1B (Llama arch), MLX 8-bit ---
-[models."cpmopus-fable5-1b"]
-# MiniCPM5-1B-Claude-Opus-Fable5-Thinking — a 1B Llama-arch reasoning/coding tune (Opus
-# Fable5 data, Qwen3-style <think> mode). No MLX build existed upstream (only GGUF), so
-# converted from the safetensors checkpoint to 8-bit MLX (~1.1 GB, near-lossless, ~100+
-# tok/s on M4 Pro) and published to the Hub. Regenerate with:
-#   mlx_lm.convert --hf-path GnLOLot/MiniCPM5-1B-Claude-Opus-Fable5-Thinking -q --q-bits 8
-repo = "gtoxlili/MiniCPM5-1B-Claude-Opus-Fable5-Thinking-MLX-8bit"
-engine = "mlx_lm"
 default = true
-# Thinking on by default on both surfaces — a 1B leans on chain-of-thought to punch above
-# its size. (A per-request enable_thinking / the bot's /think toggle still override these.)
+# The build ships the vision + video preprocessors, so the weights are multimodal-capable:
+# "auto" takes mlx-lm's text path (verified — it loads, no mlx-vlm fallback). Force "mlx_vlm"
+# if you want image input to actually work, at the cost of the faster text path.
+engine = "auto"
+# Context ceilings, in order: 262144 (256k) native — this build's max_position_embeddings,
+# with rope_type still "default" — and 1M only after switching rope_parameters to YaRN
+# (factor 4.0), which the model card supports on vLLM/SGLang/TokenSpeed but NOT MLX.
+# Both are academic here: the wired limit binds long before either.
+# KV is cheap: only 16 of 64 layers use full attention (interval 4), and 4 KV heads x 256
+# head_dim is ~32 KiB/token at the 8-bit KV this server runs. So:
+#   128k  -> 4.0 GiB KV  + 15.0 GiB weights = 19.0 GiB, ~2.5 GiB left for prefill activations
+#   160k  -> 5.0 GiB KV                     = 20.0 GiB, too tight to be safe
+#   256k  -> 8.0 GiB KV                     = 23.0 GiB, over the 21.5 GiB limit
+# 128k it is. Raising this further means dropping to 4-bit KV (halves the per-token cost).
+context = 131072
+# Thinking ON by default on both surfaces — this is also the model's own documented default
+# ("Thinking mode is on by default and can be disabled per request"). It costs real
+# wall-clock at 14 tok/s, and <think> shares the output budget with the answer, so both
+# MAX_TOKENS settings are sized for that. Disable per request with enable_thinking:false,
+# or per user with the bot's /think toggle.
 enable_thinking = true       # API default
 tg_enable_thinking = true    # Telegram-bot default
-# 128k (131072) is the model's max supported context: max_position_embeddings, and the model
-# card states "Context Length: 131,072" with no rope-scaling/YaRN to extend it. So this is the
-# real ceiling — anything higher would just be RoPE extrapolation past what it was built for.
-context = 131072

@@ -12,7 +12,7 @@ Behavior:
   approve via inline buttons; approved user ids are remembered in SQLite. Other bots and the
   bot's own messages are ignored.
 - **Per-(chat, user) memory + prefs.** A short bounded conversation history per user, plus each
-  user's own model (``/model``) and thinking toggle (``/think``) — all persisted to SQLite.
+  user's own thinking toggle (``/think``) — all persisted to SQLite.
 - **Interrupt + merge.** If a user sends a new message while the bot is still generating
   *that user's* reply, the in-flight generation is aborted and a fresh one runs over the
   **merged** messages — so the user gets one coherent answer, not two.
@@ -85,7 +85,6 @@ class Channel:
     worker: asyncio.Task | None = None  # the loop draining `pending`
     loaded: bool = False  # whether history + prefs were hydrated from the store yet
     load_lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # serialize hydration
-    model: str | None = None  # per-user model override (None = bot default)
     thinking: bool | None = None  # per-user thinking override (None = bot default)
 
 
@@ -158,15 +157,6 @@ class HistoryStore:
             return None, None
         model, thinking = row
         return model, (None if thinking is None else bool(thinking))
-
-    def set_model(self, chat_id: int, user_id: int, model: str) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO prefs(chat_id, user_id, model) VALUES(?,?,?) "
-                "ON CONFLICT(chat_id, user_id) DO UPDATE SET model=excluded.model",
-                (chat_id, user_id, model),
-            )
-            self._conn.commit()
 
     def set_thinking(self, chat_id: int, user_id: int, thinking: bool) -> None:
         with self._lock:
@@ -279,7 +269,6 @@ class TelegramBot:
             await self._api_quiet(
                 "setMyCommands",
                 commands=[
-                    {"command": "model", "description": "选择模型 / choose model"},
                     {"command": "think", "description": "开关思考 / toggle reasoning"},
                     {"command": "reset", "description": "清空上下文 / clear context"},
                 ],
@@ -404,8 +393,6 @@ class TelegramBot:
             if cmd == "reset":
                 self._reset(chat_id, uid)
                 self._spawn(self._send_plain(chat_id, "🧹 已清空我们的对话上下文。", mid))
-            elif cmd == "model":
-                self._spawn(self._cmd_model(chat_id, uid, mid, arg))
             elif cmd in ("think", "thinking"):
                 self._spawn(self._cmd_think(chat_id, uid, mid, arg))
             return
@@ -428,14 +415,12 @@ class TelegramBot:
             if cmd == "reset":
                 self._reset(chat_id, user_id)
                 self._spawn(self._send_plain(chat_id, "🧹 已清空我们的对话上下文。", mid))
-            elif cmd == "model":
-                self._spawn(self._cmd_model(chat_id, user_id, mid, arg))
             elif cmd in ("think", "thinking"):
                 self._spawn(self._cmd_think(chat_id, user_id, mid, arg))
             elif cmd in ("start", "help"):
                 self._spawn(self._send_plain(
                     chat_id,
-                    "你好,直接发消息就行。命令:/model 选模型 · /think 开关思考 · /reset 清空上下文",
+                    "你好,直接发消息就行。命令:/think 开关思考 · /reset 清空上下文",
                     mid,
                 ))
             return
@@ -558,28 +543,6 @@ class TelegramBot:
 
     # ------------------------------------------------------------------ commands / prefs
 
-    async def _cmd_model(self, chat_id, user_id, reply_to, arg: str) -> None:
-        """/model — pick the model this user chats with (inline keyboard, or /model <name>)."""
-        chan = self._get_channel(chat_id, user_id)
-        await self._ensure_loaded(chan, chat_id, user_id)
-        if arg:
-            if arg in self.settings.models:
-                chan.model = arg
-                await self._save_pref(chat_id, user_id, model=arg)
-                await self._send_plain(chat_id, f"✅ 你的模型已切到 {arg}", reply_to)
-            else:
-                opts = "、".join(self.settings.models)
-                await self._send_plain(chat_id, f"未知模型：{arg}\n可选：{opts}", reply_to)
-            return
-        current = chan.model or self.default_model
-        await self._api_quiet(
-            "sendMessage",
-            chat_id=chat_id,
-            text=f"你当前的模型：{current}\n点下面切换（每人独立）：",
-            reply_parameters={"message_id": reply_to, "allow_sending_without_reply": True},
-            reply_markup=self._model_keyboard(current),
-        )
-
     def _thinking_default(self, model: str | None) -> bool:
         """Bot thinking default for a model: its per-model tg_enable_thinking (off unless set)."""
         spec = self.settings.models.get(model) if model else None
@@ -602,7 +565,7 @@ class TelegramBot:
             return
         current = (
             chan.thinking if chan.thinking is not None
-            else self._thinking_default(chan.model or self.default_model)
+            else self._thinking_default(self.default_model)
         )
         await self._api_quiet(
             "sendMessage",
@@ -627,24 +590,13 @@ class TelegramBot:
             return
         chan = self._get_channel(chat_id, user_id)
         await self._ensure_loaded(chan, chat_id, user_id)
-        if data.startswith("m:") and data[2:] in self.settings.models:
-            chan.model = data[2:]
-            await self._save_pref(chat_id, user_id, model=chan.model)
-            toast = f"✅ 模型已切到 {chan.model}"
-        elif data in ("t:1", "t:0"):
+        if data in ("t:1", "t:0"):
             chan.thinking = data == "t:1"
             await self._save_pref(chat_id, user_id, thinking=chan.thinking)
             toast = "✅ 思考已开启" if chan.thinking else "✅ 思考已关闭"
         else:
             toast = None
         await self._api_quiet("answerCallbackQuery", callback_query_id=cb_id, text=toast)
-
-    def _model_keyboard(self, current: str) -> dict:
-        rows = [
-            [{"text": ("✅ " if name == current else "") + name, "callback_data": f"m:{name}"}]
-            for name in self.settings.models
-        ]
-        return {"inline_keyboard": rows}
 
     def _think_keyboard(self, current: bool) -> dict:
         return {
@@ -654,14 +606,10 @@ class TelegramBot:
             ]]
         }
 
-    async def _save_pref(
-        self, chat_id, user_id, *, model: str | None = None, thinking: bool | None = None
-    ) -> None:
+    async def _save_pref(self, chat_id, user_id, *, thinking: bool | None = None) -> None:
         if self._store is None:
             return
         try:
-            if model is not None:
-                await asyncio.to_thread(self._store.set_model, chat_id, user_id, model)
             if thinking is not None:
                 await asyncio.to_thread(self._store.set_thinking, chat_id, user_id, thinking)
         except Exception as exc:
@@ -740,7 +688,7 @@ class TelegramBot:
                 continue
 
             await self._ensure_loaded(chan, chat_id, user_id)
-            model = chan.model or self.default_model
+            model = self.default_model
             thinking = (
                 chan.thinking if chan.thinking is not None
                 else self._thinking_default(model)
@@ -826,9 +774,7 @@ class TelegramBot:
             try:
                 cap = max(0, self.settings.tg_history_turns) * 2
                 chan.history = await asyncio.to_thread(self._store.load, chat_id, user_id, cap)
-                model, thinking = await asyncio.to_thread(self._store.get_prefs, chat_id, user_id)
-                if model and model in self.settings.models:
-                    chan.model = model
+                _, thinking = await asyncio.to_thread(self._store.get_prefs, chat_id, user_id)
                 if thinking is not None:
                     chan.thinking = thinking
                 if chan.history:
@@ -873,8 +819,9 @@ class TelegramBot:
         loop = asyncio.get_running_loop()
         params = {
             "max_tokens": self.settings.tg_max_tokens,
-            "temperature": 0.7,
+            "temperature": self.settings.tg_temperature,
             "top_p": 0.95,
+            "top_k": self.settings.tg_top_k or None,
             "enable_thinking": enable_thinking,
             # Bot KV is quantized harder than the API (default 4-bit vs 8): chats are frequent
             # and short, so the smaller cache trims memory/bandwidth at a tiny quality cost.
@@ -887,6 +834,9 @@ class TelegramBot:
             "loop_guard": self.settings.loop_guard,
             # Trim oldest history so prompt + reserved output fit the model's context window.
             "max_prompt_tokens": self._prompt_budget(model),
+            # Same guard as the API: the engine clamps max_tokens against the fitted
+            # prompt so the pair can never overflow the window (and the wired limit).
+            "context": (lambda sp: sp.context if sp else 0)(self.settings.models.get(model)),
             # OpenAI-style tool schemas (web search/scrape); None = no tools offered this turn.
             "tools": tools,
         }

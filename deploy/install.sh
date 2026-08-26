@@ -59,6 +59,12 @@ cat > "$PLIST" <<PLIST
         <key>MLX_LAZYSERVE_IDLE_TIMEOUT</key><string>${MLX_LAZYSERVE_IDLE_TIMEOUT:-600}</string>
         <key>MLX_LAZYSERVE_MAX_TOKENS</key><string>${MLX_LAZYSERVE_MAX_TOKENS:-8192}</string>
         <key>MLX_LAZYSERVE_KV_BITS</key><string>${MLX_LAZYSERVE_KV_BITS:-0}</string>
+        <key>MLX_LAZYSERVE_TEMPERATURE</key><string>${MLX_LAZYSERVE_TEMPERATURE:-}</string>
+        <key>MLX_LAZYSERVE_TOP_K</key><string>${MLX_LAZYSERVE_TOP_K:-}</string>
+        <key>MLX_LAZYSERVE_MIN_P</key><string>${MLX_LAZYSERVE_MIN_P:-}</string>
+        <key>MLX_LAZYSERVE_REPETITION_PENALTY</key><string>${MLX_LAZYSERVE_REPETITION_PENALTY:-}</string>
+        <key>MLX_LAZYSERVE_REPETITION_CONTEXT</key><string>${MLX_LAZYSERVE_REPETITION_CONTEXT:-}</string>
+        <key>MLX_LAZYSERVE_LOOP_GUARD</key><string>${MLX_LAZYSERVE_LOOP_GUARD:-}</string>
         <key>MLX_LAZYSERVE_WIRED_LIMIT_MB</key><string>${MLX_LAZYSERVE_WIRED_LIMIT_MB:-0}</string>
         <key>MLX_LAZYSERVE_API_KEYS</key><string>${MLX_LAZYSERVE_API_KEYS:-}</string>
         <key>MLX_LAZYSERVE_TG_BOT_TOKEN</key><string>${MLX_LAZYSERVE_TG_BOT_TOKEN:-}</string>
@@ -66,10 +72,17 @@ cat > "$PLIST" <<PLIST
         <key>MLX_LAZYSERVE_TG_SYSTEM_PROMPT</key><string>${MLX_LAZYSERVE_TG_SYSTEM_PROMPT:-}</string>
         <key>MLX_LAZYSERVE_TG_MAX_TOKENS</key><string>${MLX_LAZYSERVE_TG_MAX_TOKENS:-}</string>
         <key>MLX_LAZYSERVE_TG_KV_BITS</key><string>${MLX_LAZYSERVE_TG_KV_BITS:-4}</string>
+        <key>MLX_LAZYSERVE_TG_TEMPERATURE</key><string>${MLX_LAZYSERVE_TG_TEMPERATURE:-}</string>
+        <key>MLX_LAZYSERVE_TG_TOP_K</key><string>${MLX_LAZYSERVE_TG_TOP_K:-}</string>
+        <key>MLX_LAZYSERVE_TG_MIN_P</key><string>${MLX_LAZYSERVE_TG_MIN_P:-}</string>
+        <key>MLX_LAZYSERVE_TG_REPETITION_PENALTY</key><string>${MLX_LAZYSERVE_TG_REPETITION_PENALTY:-}</string>
         <key>MLX_LAZYSERVE_TG_HISTORY_TURNS</key><string>${MLX_LAZYSERVE_TG_HISTORY_TURNS:-8}</string>
         <key>MLX_LAZYSERVE_TG_OWNER_IDS</key><string>${MLX_LAZYSERVE_TG_OWNER_IDS:-}</string>
         <key>MLX_LAZYSERVE_TG_DB_PATH</key><string>${MLX_LAZYSERVE_TG_DB_PATH:-${RUNTIME}/telegram-history.db}</string>
         <key>MLX_LAZYSERVE_TG_WEB_TOOLS</key><string>${MLX_LAZYSERVE_TG_WEB_TOOLS:-true}</string>
+        <key>MLX_LAZYSERVE_TG_WEB_MAX_ITERS</key><string>${MLX_LAZYSERVE_TG_WEB_MAX_ITERS:-}</string>
+        <key>MLX_LAZYSERVE_TG_WEB_RESULT_CHARS</key><string>${MLX_LAZYSERVE_TG_WEB_RESULT_CHARS:-}</string>
+        <key>MLX_LAZYSERVE_TG_WEB_SEARCH_LIMIT</key><string>${MLX_LAZYSERVE_TG_WEB_SEARCH_LIMIT:-}</string>
         <key>MLX_LAZYSERVE_FIRECRAWL_API_KEY</key><string>${MLX_LAZYSERVE_FIRECRAWL_API_KEY:-}</string>
         <key>HF_HUB_DISABLE_XET</key><string>${HF_HUB_DISABLE_XET:-1}</string>
         <key>HF_TOKEN</key><string>${HF_TOKEN:-}</string>
