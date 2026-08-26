@@ -1176,7 +1176,8 @@ class TelegramBot:
             logger.warning("chat_history_search failed in %s: %s", chat_id, exc)
             return f"检索群聊记录失败：{exc}"
 
-    async def _agentic_generate(self, chat_id, convo: list[dict], abort, model, thinking):
+    async def _agentic_generate(self, chat_id, convo: list[dict], abort, model, thinking,
+                                on_delta=None):
         """Generate a reply, letting the model call web tools (Firecrawl) and feeding results back.
 
         Loops model → tool → model until the model answers without a tool call or the round cap
@@ -1195,7 +1196,7 @@ class TelegramBot:
         for step in range(self.settings.tg_web_max_iters + 1):
             offer = tools if (tools and step < self.settings.tg_web_max_iters) else None
             text, reasoning, tool_calls, interrupted, error = await self._generate(
-                convo, abort, model, thinking, tools=offer
+                convo, abort, model, thinking, tools=offer, on_delta=on_delta
             )
             if interrupted or error or not tool_calls:
                 break
