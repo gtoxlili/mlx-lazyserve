@@ -34,6 +34,7 @@ import logging
 import re
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass, field
 
 from .config import Settings
@@ -116,7 +117,105 @@ class HistoryStore:
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS dm_allowed(user_id INTEGER PRIMARY KEY)"
         )
+        # Every group message, not just the ones addressed to the bot — Telegram already
+        # delivers them all (privacy mode is off), they were simply being dropped. This is
+        # what makes "what did @someone say about X" answerable at all.
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS group_log("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, "
+            "message_id INTEGER NOT NULL, user_id INTEGER NOT NULL, name TEXT NOT NULL, "
+            "username TEXT, text TEXT NOT NULL, ts INTEGER NOT NULL)"
+        )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_glog_msg ON group_log(chat_id, message_id)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_glog_user ON group_log(chat_id, user_id, id)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_glog_uname ON group_log(chat_id, username, id)"
+        )
         self._conn.commit()
+
+    def log_group(self, chat_id, message_id, user_id, name, username, text, ts, cap) -> None:
+        """Record one group message, then prune the chat back to ``cap`` rows.
+
+        No FTS index: recall is always scoped to one @-mentioned user first, which leaves a
+        few thousand rows to scan at most (0.3 ms for 9k rows). FTS5 would also have been the
+        wrong tool here — its unicode61 tokenizer treats a run of Chinese as a single token,
+        and trigram silently misses any query under 3 characters, which is most Chinese words.
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO group_log"
+                "(chat_id, message_id, user_id, name, username, text, ts) VALUES(?,?,?,?,?,?,?)",
+                (chat_id, message_id, user_id, name, username, text, ts),
+            )
+            self._conn.execute(
+                "DELETE FROM group_log WHERE chat_id=? AND id <= ("
+                "  SELECT id FROM group_log WHERE chat_id=? ORDER BY id DESC LIMIT 1 OFFSET ?)",
+                (chat_id, chat_id, cap),
+            )
+            self._conn.commit()
+
+    def resolve_handle(self, chat_id: int, username: str) -> int | None:
+        """@handle -> user_id, from whoever last spoke under that handle in this chat."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT user_id FROM group_log WHERE chat_id=? AND lower(username)=lower(?) "
+                "ORDER BY id DESC LIMIT 1",
+                (chat_id, username),
+            ).fetchone()
+        return row[0] if row else None
+
+    def search(self, chat_id: int, terms: list[str], user_id: int | None, limit: int) -> list[tuple]:
+        """Group messages matching ``terms``, best match first, as ``(name, text, ts)``.
+
+        A plain scan, not FTS5: the model writes the query so the terms are already words,
+        and FTS5 would have been the wrong index anyway — its unicode61 tokenizer treats a
+        run of Chinese as one token and trigram silently drops any query under 3 characters,
+        which is most Chinese words. 50k rows scan in about 2 ms.
+
+        Ranked by how many distinct terms a message hit, then by recency, so a message that
+        matches the whole question beats one that happened to share a single common word.
+        """
+        esc = lambda t: t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        where = "chat_id=?" + ("" if user_id is None else " AND user_id=?")
+        base = [chat_id] + ([] if user_id is None else [user_id])
+        hits: dict[int, list] = {}
+        with self._lock:
+            for term in terms[:8]:
+                for rid, name, text, ts in self._conn.execute(
+                    f"SELECT id, name, text, ts FROM group_log WHERE {where} "
+                    "AND text LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT ?",
+                    (*base, f"%{esc(term)}%", limit * 4),
+                ):
+                    row = hits.setdefault(rid, [0, name, text, ts])
+                    row[0] += 1
+        best = sorted(hits.items(), key=lambda kv: (kv[1][0], kv[0]), reverse=True)[:limit]
+        return [(v[1], v[2], v[3]) for _, v in sorted(best, key=lambda kv: kv[0])]
+
+    def recent(self, chat_id: int, user_id: int | None, limit: int) -> list[tuple]:
+        """Newest messages, for when the model asks what someone has been saying lately."""
+        where = "chat_id=?" + ("" if user_id is None else " AND user_id=?")
+        base = [chat_id] + ([] if user_id is None else [user_id])
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT name, text, ts FROM group_log WHERE {where} ORDER BY id DESC LIMIT ?",
+                (*base, limit),
+            ).fetchall()
+        return list(reversed(rows))
+
+    def resolve_name(self, chat_id: int, needle: str) -> int | None:
+        """Display name or @handle -> user_id, matching whoever most recently used it."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT user_id FROM group_log WHERE chat_id=? AND "
+                "(lower(username)=lower(?) OR lower(name)=lower(?) OR name LIKE ?) "
+                "ORDER BY id DESC LIMIT 1",
+                (chat_id, needle, needle, f"%{needle}%"),
+            ).fetchone()
+        return row[0] if row else None
 
     def load(self, chat_id: int, user_id: int, limit: int) -> list[dict]:
         with self._lock:
@@ -388,6 +487,9 @@ class TelegramBot:
         chat_id = chat.get("id")
 
         text = (message.get("text") or message.get("caption") or "").strip()
+        # Log BEFORE the trigger check: the whole point is to keep the messages that are not
+        # addressed to the bot, since those are what a later "what did @someone say" needs.
+        self._log_group_message(message, chat_id, frm, text)
         cmd, arg = self._parse_command(text)
         if cmd is not None:
             uid, mid = frm["id"], message.get("message_id")
@@ -553,6 +655,18 @@ class TelegramBot:
         name = ((frm.get("first_name") or "") + " " + (frm.get("last_name") or "")).strip()
         who = name or frm.get("username") or "某人"
         return f"[引用 · {who} 说]\n{body}"
+
+    HANDLE_RE = re.compile(r"@([A-Za-z0-9_]{4,32})")
+    def _log_group_message(self, message: dict, chat_id: int, frm: dict, text: str) -> None:
+        cap = self.settings.tg_group_log_cap
+        if self._store is None or cap <= 0 or not text or text.startswith("/"):
+            return
+        name = ((frm.get("first_name") or "") + " " + (frm.get("last_name") or "")).strip()
+        name = name or frm.get("username") or str(frm.get("id"))
+        self._spawn(asyncio.to_thread(
+            self._store.log_group, chat_id, message.get("message_id"), frm["id"],
+            name, frm.get("username"), text, int(time.time()), cap,
+        ))
 
     def _strip_mention(self, text: str) -> str:
         if not self.username:
@@ -957,9 +1071,91 @@ class TelegramBot:
 
     # ------------------------------------------------------------------ web tools (agentic)
 
-    def _web_tools(self) -> list | None:
-        """Tool schemas advertised to the model this turn, or None when web tools are off."""
-        return TOOL_SCHEMAS if self._fc is not None else None
+    CHAT_SEARCH_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "chat_history_search",
+            "description": (
+                "Search this group's full message history — everything everyone has said, "
+                "not just the part of the conversation you were shown. Your own context holds "
+                "only the last few turns with the person talking to you right now, so use this "
+                "whenever the answer depends on something said earlier: a decision or plan the "
+                "group made, who said what, what someone thinks about a topic, a link or number "
+                "mentioned before, or any 'as we discussed' / 'that thing X said' reference. "
+                "Returns matching messages with sender and timestamp, oldest first."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Words that would literally appear in the messages, space-separated "
+                            "(e.g. '方案 排期' or 'docker 部署'). Not a question — keywords. "
+                            "Leave empty to just read the latest messages."
+                        ),
+                    },
+                    "person": {
+                        "type": "string",
+                        "description": "Optional. Limit to one person, by @handle or display name.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many messages to return, 1-20. Default 10.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    }
+
+    def _tools_for(self, chat_id: int) -> list | None:
+        """Tool schemas advertised for this chat, or None when it has none.
+
+        The chat-history tool is offered in groups only. Only ``_handle_group`` writes to
+        group_log, so in a private chat it could only ever answer "nothing found" — and an
+        empty tool round is not free here: the model spends a full generate + retry on it,
+        20-40s of wall clock, to learn nothing. Groups are also the only place the data is
+        already shared with everyone who could ask for it.
+
+        Telegram guarantees the sign: group and supergroup ids are negative, a private chat's
+        id is the positive user id.
+        """
+        tools = list(TOOL_SCHEMAS) if self._fc is not None else []
+        if chat_id < 0 and self._store is not None and self.settings.tg_group_log_cap > 0:
+            tools.append(self.CHAT_SEARCH_TOOL)
+        return tools or None
+
+    async def _chat_history_search(self, chat_id: int, args: dict) -> str:
+        """Run the chat-history tool. Never raises — a tool error must not kill the turn."""
+        try:
+            query = str(args.get("query") or "").strip()
+            person = str(args.get("person") or "").strip().lstrip("@")
+            try:
+                limit = max(1, min(20, int(args.get("limit") or 10)))
+            except (TypeError, ValueError):
+                limit = 10
+            uid = self._store.resolve_name(chat_id, person) if person else None
+            if person and uid is None:
+                return f"群里没有找到叫「{person}」的人（只认已经发过言的成员）。"
+            terms = [t for t in query.split() if t]
+            rows = (
+                await asyncio.to_thread(self._store.search, chat_id, terms, uid, limit)
+                if terms
+                else await asyncio.to_thread(self._store.recent, chat_id, uid, limit)
+            )
+            if not rows:
+                return "群聊记录里没有匹配的内容。"
+            out = []
+            for name, text, ts in rows:
+                stamp = time.strftime("%m-%d %H:%M", time.localtime(ts))
+                out.append(f"[{stamp}] {name}: {text}")
+            block = "\n".join(out)
+            cap = self.settings.tg_recall_chars
+            return block if len(block) <= cap else block[:cap] + "\n…（结果已截断）"
+        except Exception as exc:
+            logger.warning("chat_history_search failed in %s: %s", chat_id, exc)
+            return f"检索群聊记录失败：{exc}"
 
     async def _agentic_generate(self, chat_id, convo: list[dict], abort, model, thinking):
         """Generate a reply, letting the model call web tools (Firecrawl) and feeding results back.
@@ -972,7 +1168,7 @@ class TelegramBot:
         caller re-batches, exactly as in the no-tools path. Returns the same
         ``(text, reasoning, interrupted, error)`` shape the worker already expects.
         """
-        tools = self._web_tools()
+        tools = self._tools_for(chat_id)
         status_mid: int | None = None
         text = reasoning = ""
         interrupted = False
@@ -992,13 +1188,13 @@ class TelegramBot:
                 status_mid = await self._web_status(chat_id, tool_calls)
             # Keep the model's own tool-call turn in context, then append each tool result.
             convo.append({"role": "assistant", "content": text or "", "tool_calls": tool_calls})
-            await self._run_tools(convo, tool_calls)
+            await self._run_tools(convo, chat_id, tool_calls)
         if status_mid is not None:
             await self._api_quiet("deleteMessage", chat_id=chat_id, message_id=status_mid)
         return text, reasoning, interrupted, error
 
-    async def _run_tools(self, convo: list[dict], tool_calls: list) -> None:
-        """Execute each tool call against Firecrawl (concurrently) and append a ``tool`` message."""
+    async def _run_tools(self, convo: list[dict], chat_id: int, tool_calls: list) -> None:
+        """Run each tool call concurrently and append its ``tool`` message."""
         async def run_one(tc: dict) -> dict:
             fn = tc.get("function") or {}
             name = fn.get("name") or ""
@@ -1008,7 +1204,12 @@ class TelegramBot:
                     args = {}
             except (ValueError, TypeError):
                 args = {}
-            result = await self._fc.dispatch(name, args)
+            if name == "chat_history_search":
+                result = await self._chat_history_search(chat_id, args)
+            elif self._fc is not None:
+                result = await self._fc.dispatch(name, args)
+            else:
+                result = f"工具 {name} 当前不可用。"
             return {"role": "tool", "tool_call_id": tc.get("id"), "name": name, "content": result}
 
         convo.extend(await asyncio.gather(*(run_one(tc) for tc in tool_calls)))
@@ -1016,7 +1217,9 @@ class TelegramBot:
     async def _web_status(self, chat_id, tool_calls: list) -> int | None:
         """Post a transient 'browsing the web' note; its id is returned so we can delete it."""
         names = {(tc.get("function") or {}).get("name") for tc in tool_calls}
-        if "web_search" in names:
+        if "chat_history_search" in names:
+            text = "📖 正在翻群聊记录…"
+        elif "web_search" in names:
             text = "🔍 正在联网搜索…"
         elif "web_scrape" in names:
             text = "🌐 正在读取网页…"

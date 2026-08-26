@@ -83,6 +83,9 @@ cat > "$PLIST" <<PLIST
         <key>MLX_LAZYSERVE_TG_WEB_MAX_ITERS</key><string>${MLX_LAZYSERVE_TG_WEB_MAX_ITERS:-}</string>
         <key>MLX_LAZYSERVE_TG_WEB_RESULT_CHARS</key><string>${MLX_LAZYSERVE_TG_WEB_RESULT_CHARS:-}</string>
         <key>MLX_LAZYSERVE_TG_WEB_SEARCH_LIMIT</key><string>${MLX_LAZYSERVE_TG_WEB_SEARCH_LIMIT:-}</string>
+        <key>MLX_LAZYSERVE_TG_GROUP_LOG_CAP</key><string>${MLX_LAZYSERVE_TG_GROUP_LOG_CAP:-}</string>
+        <key>MLX_LAZYSERVE_TG_RECALL_MSGS</key><string>${MLX_LAZYSERVE_TG_RECALL_MSGS:-}</string>
+        <key>MLX_LAZYSERVE_TG_RECALL_CHARS</key><string>${MLX_LAZYSERVE_TG_RECALL_CHARS:-}</string>
         <key>MLX_LAZYSERVE_FIRECRAWL_API_KEY</key><string>${MLX_LAZYSERVE_FIRECRAWL_API_KEY:-}</string>
         <key>HF_HUB_DISABLE_XET</key><string>${HF_HUB_DISABLE_XET:-1}</string>
         <key>HF_TOKEN</key><string>${HF_TOKEN:-}</string>

@@ -59,6 +59,10 @@ class Settings:
     tg_web_max_iters: int  # max model<->tool round-trips before the model must answer
     tg_web_result_chars: int  # cap per tool result fed back to the model (context hygiene)
     tg_web_search_limit: int  # default web_search result count
+    # Group log: every message in a group, kept so the bot can recall what a person said.
+    tg_group_log_cap: int  # rows kept per chat (0 = don't log group messages at all)
+    tg_recall_msgs: int  # messages recalled per @-mentioned person
+    tg_recall_chars: int  # cap on the recalled block (prefill is ~70 tok/s — keep it small)
 
 
 def _registry_path() -> Path:
@@ -203,4 +207,7 @@ def load_settings() -> Settings:
         tg_web_max_iters=_int_env("MLX_LAZYSERVE_TG_WEB_MAX_ITERS", 3),
         tg_web_result_chars=_int_env("MLX_LAZYSERVE_TG_WEB_RESULT_CHARS", 6000),
         tg_web_search_limit=_int_env("MLX_LAZYSERVE_TG_WEB_SEARCH_LIMIT", 5),
+        tg_group_log_cap=_int_env("MLX_LAZYSERVE_TG_GROUP_LOG_CAP", 50000),
+        tg_recall_msgs=_int_env("MLX_LAZYSERVE_TG_RECALL_MSGS", 10),
+        tg_recall_chars=_int_env("MLX_LAZYSERVE_TG_RECALL_CHARS", 1200),
     )

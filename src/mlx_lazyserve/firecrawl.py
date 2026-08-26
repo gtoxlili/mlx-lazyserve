@@ -89,6 +89,44 @@ _TRAILING_WS = re.compile(r"[ \t]+$", re.M)
 _BLANK_RUN = re.compile(r"\n{3,}")
 
 
+_LINK = re.compile(r"\[([^\]]*)\]\((?:[^)]*)\)")
+
+
+def _prune_markdown(md: str) -> str:
+    """Cut a scraped page down to the part worth spending prefill on.
+
+    Firecrawl's ``onlyMainContent`` does not strip site chrome on plenty of real pages: a
+    weather site came back 22k characters, a quarter of its lines pure navigation. That is
+    ~16k tokens, and prefill runs about 65 tok/s here, so an unpruned page can cost four
+    minutes of wall clock before the model says anything.
+
+    Three passes, all content-preserving:
+
+    * drop navigation rows — three or more links in a line with almost no text between them;
+    * keep link text, drop the URL — on that same page the URLs alone were half the bytes,
+      and the model gets URLs from web_search when it actually needs to follow one;
+    * drop consecutive duplicate lines and squeeze whitespace.
+
+    Deliberately NOT dropping short label-only lines, which saves another ~50%: "℃",
+    "晴", "多云", "东风" all match that shape, and on a weather page those labels *are* the
+    answer.
+    """
+    kept: list[str] = []
+    for line in md.splitlines():
+        if len(_LINK.findall(line)) >= 3 and len(_LINK.sub("", line).strip()) <= 8:
+            continue
+        kept.append(_LINK.sub(r"\1", line))
+    out: list[str] = []
+    prev = None
+    for line in kept:
+        stripped = line.strip()
+        if stripped and stripped == prev:
+            continue
+        prev = stripped
+        out.append(line.rstrip())
+    return "\n".join(out)
+
+
 def _clean_markdown(md: str) -> str:
     """Strip images/base64/tracking/whitespace noise from scraped markdown (see module note)."""
     if not md:
@@ -97,6 +135,7 @@ def _clean_markdown(md: str) -> str:
     md = _DATA_IMG.sub("", md)
     md = _TRACK.sub(r"\1", md)
     md = _DANGLING_Q.sub(r"\1", md)
+    md = _prune_markdown(md)
     md = _TRAILING_WS.sub("", md)
     md = _BLANK_RUN.sub("\n\n", md)
     return md.strip()

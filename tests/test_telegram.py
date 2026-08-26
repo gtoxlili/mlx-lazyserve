@@ -107,3 +107,147 @@ class ComposeTurnTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChatHistoryStoreTests(unittest.TestCase):
+    """Storage for messages nobody addressed to the bot — the ones that make
+    "what did the group decide about X" answerable at all."""
+
+    def setUp(self):
+        import os
+        import tempfile
+
+        from mlx_lazyserve.telegram import HistoryStore
+        self.store = HistoryStore(os.path.join(tempfile.mkdtemp(), "t.db"))
+
+    def add(self, mid, uid, name, uname, text, ts=1000, cap=1000):
+        self.store.log_group(1, mid, uid, name, uname, text, ts, cap)
+
+    def test_the_same_message_is_never_logged_twice(self):
+        self.add(1, 11, "张三", "zhangsan", "早")
+        self.add(1, 11, "张三", "zhangsan", "早")
+        self.assertEqual(len(self.store.recent(1, None, 10)), 1)
+
+    def test_search_spans_the_whole_group(self):
+        self.add(1, 11, "张三", "zhangsan", "方案要分两期")
+        self.add(2, 22, "李四", "lisi", "方案预算不够")
+        self.assertEqual(len(self.store.search(1, ["方案"], None, 10)), 2)
+
+    def test_search_can_be_limited_to_one_person(self):
+        self.add(1, 11, "张三", "zhangsan", "方案要分两期")
+        self.add(2, 22, "李四", "lisi", "方案预算不够")
+        rows = self.store.search(1, ["方案"], 11, 10)
+        self.assertEqual([r[1] for r in rows], ["方案要分两期"])
+
+    def test_more_matching_terms_ranks_higher(self):
+        self.add(1, 11, "张三", "zhangsan", "只提到方案")
+        self.add(2, 11, "张三", "zhangsan", "方案和排期都定了")
+        rows = self.store.search(1, ["方案", "排期"], None, 1)
+        self.assertEqual(rows[0][1], "方案和排期都定了")
+
+    def test_an_old_match_beats_a_recent_non_match(self):
+        # The point of searching is reaching past the recency window.
+        self.add(1, 11, "张三", "zhangsan", "关于方案的老发言")
+        for i in range(2, 40):
+            self.add(i, 11, "张三", "zhangsan", f"闲聊{i}")
+        self.assertEqual([r[1] for r in self.store.search(1, ["方案"], None, 5)],
+                         ["关于方案的老发言"])
+
+    def test_two_character_chinese_terms_match(self):
+        # Why this is a scan and not FTS5: trigram needs 3+ characters and would silently
+        # miss most Chinese words.
+        self.add(1, 11, "张三", "zhangsan", "这个方案可以")
+        self.assertTrue(self.store.search(1, ["方案"], None, 5))
+
+    def test_like_wildcards_in_a_query_are_literals(self):
+        self.add(1, 11, "张三", "zhangsan", "AxB")
+        self.assertFalse(self.store.search(1, ["A_B"], None, 5))
+
+    def test_recent_returns_oldest_first(self):
+        for i in range(1, 6):
+            self.add(i, 11, "张三", "zhangsan", f"m{i}")
+        self.assertEqual([r[1] for r in self.store.recent(1, None, 3)], ["m3", "m4", "m5"])
+
+    def test_the_log_is_pruned_to_the_cap(self):
+        for i in range(1, 31):
+            self.add(i, 11, "张三", "zhangsan", f"m{i}", cap=10)
+        rows = self.store.recent(1, None, 50)
+        self.assertLessEqual(len(rows), 10)
+        self.assertEqual(rows[-1][1], "m30")
+
+    def test_a_person_resolves_by_handle_or_display_name(self):
+        self.add(1, 11, "张三", "zhangsan", "早")
+        self.assertEqual(self.store.resolve_name(1, "zhangsan"), 11)
+        self.assertEqual(self.store.resolve_name(1, "ZhangSan"), 11)
+        self.assertEqual(self.store.resolve_name(1, "张三"), 11)
+        self.assertIsNone(self.store.resolve_name(1, "查无此人"))
+
+
+class ChatSearchToolTests(unittest.IsolatedAsyncioTestCase):
+    """The tool is what the model actually reaches for, so its argument handling has to
+    survive whatever the model puts in the JSON."""
+
+    def setUp(self):
+        import os
+        import tempfile
+        from types import SimpleNamespace
+
+        from mlx_lazyserve.telegram import HistoryStore
+        self.b = bot()
+        self.b._store = HistoryStore(os.path.join(tempfile.mkdtemp(), "t.db"))
+        self.b.settings = SimpleNamespace(tg_recall_chars=1200, tg_group_log_cap=50000)
+        self.b._store.log_group(1, 1, 11, "张三", "zhangsan", "方案分两期做", 1000, 100)
+        self.b._store.log_group(1, 2, 22, "李四", "lisi", "预算只有一半", 1001, 100)
+
+    async def test_a_keyword_query_finds_the_message(self):
+        out = await self.b._chat_history_search(1, {"query": "方案"})
+        self.assertIn("方案分两期做", out)
+        self.assertIn("张三", out)
+
+    async def test_person_narrows_the_search(self):
+        out = await self.b._chat_history_search(1, {"query": "", "person": "@lisi"})
+        self.assertIn("预算只有一半", out)
+        self.assertNotIn("方案分两期做", out)
+
+    async def test_an_unknown_person_says_so_instead_of_guessing(self):
+        out = await self.b._chat_history_search(1, {"query": "方案", "person": "查无此人"})
+        self.assertIn("没有找到", out)
+
+    async def test_an_empty_query_falls_back_to_recent_messages(self):
+        out = await self.b._chat_history_search(1, {"query": ""})
+        self.assertIn("预算只有一半", out)
+
+    async def test_a_junk_limit_does_not_blow_up(self):
+        out = await self.b._chat_history_search(1, {"query": "方案", "limit": "很多"})
+        self.assertIn("方案分两期做", out)
+
+    async def test_no_match_is_reported_plainly(self):
+        self.assertIn("没有匹配", await self.b._chat_history_search(1, {"query": "量子计算"}))
+
+
+class ToolAvailabilityTests(unittest.TestCase):
+    def make(self, has_store=True, cap=50000, fc=None):
+        from types import SimpleNamespace
+        b = bot()
+        b._store = object() if has_store else None
+        b._fc = fc
+        b.settings = SimpleNamespace(tg_group_log_cap=cap, tg_recall_chars=1200)
+        return b
+
+    def names(self, b, chat_id):
+        return [t["function"]["name"] for t in (b._tools_for(chat_id) or [])]
+
+    def test_groups_get_the_chat_history_tool(self):
+        self.assertIn("chat_history_search", self.names(self.make(), -1001))
+
+    def test_private_chats_do_not(self):
+        # Nothing writes group_log for a private chat, so the tool could only answer
+        # "nothing found" — and each wasted round costs a full generate.
+        self.assertNotIn("chat_history_search", self.names(self.make(), 584544685))
+
+    def test_it_survives_web_tools_being_off(self):
+        # Searching what the group already said needs no network.
+        self.assertEqual(self.names(self.make(fc=None), -1001), ["chat_history_search"])
+
+    def test_disabling_the_group_log_removes_the_tool(self):
+        self.assertIsNone(self.make(cap=0, fc=None)._tools_for(-1001))
