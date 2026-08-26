@@ -14,25 +14,31 @@
 
 # --- The one model. Sized to own the whole 24 GiB box; needs iogpu.wired_limit_mb=22000 ---
 [models."qwen3.8-27b"]
-# Qwen 3.8 27B (dense), "Heretic" abliteration, MLX 4-bit, ~15 GiB on disk.
+# Qwen 3.8 27B (dense), AEON Ultimate Uncensored, MLX 4-bit (affine, group 64), ~14.2 GiB.
 # Dense, so every token activates all 27B params: ~14 tok/s on an M4 Pro (16 GPU cores).
-# The idle-unload frees the ~19 GiB working set when not in use, which is most of this
+# Decoding is memory-bandwidth bound — it reads the whole weight set per token — so the
+# weight size IS the speed. Replaces a Heretic-abliterated build of the same base that was
+# 0.9 GiB larger for no benefit: mechanical abliteration with ~no community validation,
+# against AEON's 192 likes upstream.
+# The idle-unload frees the ~18 GiB working set when not in use, which is most of this
 # 24 GiB box — that reclaim is the whole point of the lazy-load design.
-repo = "TheCluster/Qwen3.8-27B-Heretic-MLX-4bit"
+repo = "choppedgarlic/Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-4bit-MLX"
 default = true
-# The build ships the vision + video preprocessors, so the weights are multimodal-capable:
-# "auto" takes mlx-lm's text path (verified — it loads, no mlx-vlm fallback). Force "mlx_vlm"
-# if you want image input to actually work, at the cost of the faster text path.
-engine = "auto"
+# Text-only build (no vision_config), which costs nothing: mlx-lm's qwen3_5 only ever
+# instantiates TextModel and its sanitize() drops every vision_tower/model.visual weight, so
+# a multimodal build's vision tower never reaches memory anyway — it is just dead download.
+# Pinned to mlx_lm rather than "auto" so a load failure surfaces instead of falling through
+# to an mlx-vlm attempt that cannot work on weights with no vision tower.
+engine = "mlx_lm"
 # Context ceilings, in order: 262144 (256k) native — this build's max_position_embeddings,
 # with rope_type still "default" — and 1M only after switching rope_parameters to YaRN
 # (factor 4.0), which the model card supports on vLLM/SGLang/TokenSpeed but NOT MLX.
 # Both are academic here: the wired limit binds long before either.
 # KV is cheap: only 16 of 64 layers use full attention (interval 4), and 4 KV heads x 256
 # head_dim is ~32 KiB/token at the 8-bit KV this server runs. So:
-#   128k  -> 4.0 GiB KV  + 15.0 GiB weights = 19.0 GiB, ~2.5 GiB left for prefill activations
-#   160k  -> 5.0 GiB KV                     = 20.0 GiB, too tight to be safe
-#   256k  -> 8.0 GiB KV                     = 23.0 GiB, over the 21.5 GiB limit
+#   128k  -> 4.0 GiB KV  + 14.2 GiB weights = 18.2 GiB, ~3.3 GiB left for prefill activations
+#   192k  -> 6.0 GiB KV                     = 20.2 GiB, too tight to be safe
+#   256k  -> 8.0 GiB KV                     = 22.2 GiB, over the 21.5 GiB limit
 # 128k it is. Raising this further means dropping to 4-bit KV (halves the per-token cost).
 context = 131072
 # Thinking ON by default on both surfaces — this is also the model's own documented default

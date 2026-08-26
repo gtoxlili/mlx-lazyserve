@@ -426,17 +426,20 @@ class _PrefixCache:
 
         # Extend to the history boundary and snapshot there, so the next turn can start
         # from it no matter what generation appends to this cache.
-        h = len(history_ids)
+        # Never snapshot the whole prompt: stream_generate still needs at least one token to
+        # feed, and a template that emits no generation prompt would otherwise leave none.
+        h = min(len(history_ids), len(prompt_ids) - 1)
+        hist = list(history_ids[:h])
         if (
             snapshot
             and self.MIN_REUSE <= h <= self.MAX_SNAPSHOT
             and h > pos
-            and history_ids == prompt_ids[:h]
+            and hist == prompt_ids[:h]
         ):
             try:
-                _prefill(model, cache, history_ids[pos:], kv_bits)
+                _prefill(model, cache, hist[pos:], kv_bits)
                 save_prompt_cache(self._path, cache)
-                self.tokens = list(history_ids)
+                self.tokens = hist
                 self.sig = sig
                 pos = h
             except Exception as exc:

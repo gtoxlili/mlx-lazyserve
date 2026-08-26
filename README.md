@@ -20,7 +20,7 @@ Configured in [`models.toml`](models.toml); weights download lazily into `~/.cac
 
 | name | repo | size |
 |---|---|---|
-| `qwen3.8-27b` (default) | `TheCluster/Qwen3.8-27B-Heretic-MLX-4bit` | ~16 GB |
+| `qwen3.8-27b` (default) | `choppedgarlic/Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-4bit-MLX` | ~15 GB |
 
 Edit `models.toml` to add your own; any MLX repo on Hugging Face works.
 
@@ -92,7 +92,7 @@ Without the rule the service still runs on the default cap (it just logs a warni
 
 ## Downloads from mainland China
 
-Most of these repos are xet-backed, and xet transfer is slow from China. Set `HF_HUB_DISABLE_XET=1` to use the classic Hugging Face CDN instead (already set in the LaunchAgent). Interrupted downloads resume when you re-run.
+Most of these repos are xet-backed. Xet used to be the slow path from here and the LaunchAgent disabled it, but that has inverted: pulling a 15 GB repo measured **37 MB/s with Xet against 6 MB/s without**, and the classic CDN path spent most of its time retrying timed-out reads. Xet is now the only acceleration huggingface_hub 1.x offers — `HF_HUB_ENABLE_HF_TRANSFER` was removed — so `HF_HUB_DISABLE_XET=0` is the default. Re-measure before flipping it back. Setting `HF_TOKEN` matters too: anonymous pulls start fast, then throttle to under 1 MB/s partway through a large repo. Interrupted downloads resume when you re-run.
 
 ## License
 
