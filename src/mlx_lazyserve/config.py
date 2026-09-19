@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 class ModelSpec:
     name: str  # friendly id exposed over the API, e.g. "qwen3.8-27b"
     repo: str  # Hugging Face MLX repo id
-    engine: str = "auto"  # "auto" | "mlx_lm" | "mlx_vlm"
+    engine: str = "auto"  # "auto" | "mlx_lm" | "mlx_vlm" | "mlx_prism"
     default: bool = False
     context: int = 8192  # context window (tokens); the bot trims prompts to fit it
     enable_thinking: bool = False  # API reasoning default for this model (off unless set)
@@ -49,6 +49,7 @@ class Settings:
     tg_min_p: float  # min-p sampling floor for bot replies
     tg_temperature: float  # sampling temperature for bot replies
     tg_top_k: int  # top-k for bot replies (0 = off / full vocab)
+    tg_think_budget: int  # cap on <think> tokens per bot reply (0 = uncapped)
     tg_history_turns: int  # per-(chat,user) (user,assistant) pairs kept as context
     tg_db_path: Path  # SQLite file persisting per-(chat,user) conversation history
     tg_owner_ids: tuple[int, ...]  # user ids allowed to add the bot to a group; empty = anyone
@@ -196,6 +197,7 @@ def load_settings() -> Settings:
             "MLX_LAZYSERVE_TG_TEMPERATURE", _float_env("MLX_LAZYSERVE_TEMPERATURE", 0.7)
         ),
         tg_top_k=_int_env("MLX_LAZYSERVE_TG_TOP_K", _int_env("MLX_LAZYSERVE_TOP_K", 0)),
+        tg_think_budget=_int_env("MLX_LAZYSERVE_TG_THINK_BUDGET", 0),
         tg_history_turns=_int_env("MLX_LAZYSERVE_TG_HISTORY_TURNS", 8),
         tg_db_path=tg_db_path,
         tg_owner_ids=tg_owner_ids,

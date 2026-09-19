@@ -2,9 +2,11 @@
 # Friendly name -> Hugging Face MLX repo. Weights download lazily on first use
 # (cached in ~/.cache/huggingface) and unload after the idle timeout.
 #
-#   engine = "auto"     try mlx-lm, fall back to mlx-vlm  (good default)
-#            "mlx_lm"   force the text engine
-#            "mlx_vlm"  force the vision-language engine (required for image input)
+#   engine = "auto"      try mlx-lm, fall back to mlx-vlm  (good default)
+#            "mlx_lm"    force the text engine
+#            "mlx_vlm"   force the vision-language engine (required for image input)
+#            "mlx_prism" Prism ML "Bonsai" ternary packs (model_type prism_hadamard_qwen35),
+#                        which stock mlx-lm cannot load at all. Never reached from "auto".
 #   context = 32768     context window in tokens (default 8192). The Telegram bot trims
 #                       old history so the prompt + reserved output stay within this.
 #   enable_thinking = true      API reasoning default for this model (default false); a
@@ -14,42 +16,85 @@
 
 # --- The one model. Sized to own the whole 24 GiB box; needs iogpu.wired_limit_mb=22000 ---
 [models."qwen3.8-27b"]
-# Qwen 3.8 27B (dense), AEON Ultimate Uncensored, MLX 4-bit (affine, group 64), ~14.2 GiB.
-# Dense, so every token activates all 27B params: ~14 tok/s on an M4 Pro (16 GPU cores).
-# Decoding is memory-bandwidth bound — it reads the whole weight set per token — so the
-# weight size IS the speed. Replaces a Heretic-abliterated build of the same base that was
-# 0.9 GiB larger for no benefit: mechanical abliteration with ~no community validation,
-# against AEON's 192 likes upstream.
-# The idle-unload frees the ~18 GiB working set when not in use, which is most of this
-# 24 GiB box — that reclaim is the whole point of the lazy-load design.
-repo = "choppedgarlic/Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-4bit-MLX"
+# Ternary Bonsai 2 27B: Qwen3.8-27B packed to ~1.72 bits/weight (stored 2.25 — MLX keeps a
+# scale and a bias per group of 128), MLX pack, 7.15 GiB resident measured here.
+# The friendly name stays "qwen3.8-27b" on purpose: it is still a Qwen3.8-27B derivative, and
+# the name is what deploy/service.env's MLX_LAZYSERVE_TG_MODEL and every API client already
+# send. Renaming it would buy accuracy nobody reads and break callers.
+repo = "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"
 default = true
-# Text-only build (no vision_config), which costs nothing: mlx-lm's qwen3_5 only ever
-# instantiates TextModel and its sanitize() drops every vision_tower/model.visual weight, so
-# a multimodal build's vision tower never reaches memory anyway — it is just dead download.
-# Pinned to mlx_lm rather than "auto" so a load failure surfaces instead of falling through
-# to an mlx-vlm attempt that cannot work on weights with no vision tower.
-engine = "mlx_lm"
-# Context ceilings, in order: 262144 (256k) native — this build's max_position_embeddings,
-# with rope_type still "default" — and 1M only after switching rope_parameters to YaRN
-# (factor 4.0), which the model card supports on vLLM/SGLang/TokenSpeed but NOT MLX.
-# Both are academic here: the wired limit binds long before either.
-# KV is cheap: only 16 of 64 layers use full attention (interval 4), and 4 KV heads x 256
-# head_dim is ~32 KiB/token at the 8-bit KV this server runs. So:
-#   128k  -> 4.0 GiB KV  + 14.2 GiB weights = 18.2 GiB, ~3.3 GiB spare  <- here
-#   192k  -> 6.0 GiB KV                     = 20.2 GiB, ~1.3 GiB spare
-#   256k  -> 8.0 GiB KV                     = 22.2 GiB, over the 21.5 GiB limit
-# Was briefly 192k. Backed off after watching the box under real load: swap sat at 72% of
-# 4 GiB with only 3.1 GiB of memory free, because this arithmetic only counts the model —
-# macOS, the bot and everything else live in what is left. Metal does not degrade when it
-# runs out either; allocation failure kills the process. Nothing has ever needed more than
-# 128k here, so the 2 GiB goes back to the system. Past 128k means 4-bit KV, not a bigger
-# window at 8-bit.
-context = 131072
-# Thinking ON by default on both surfaces — this is also the model's own documented default
-# ("Thinking mode is on by default and can be disabled per request"). It costs real
-# wall-clock at 14 tok/s, and <think> shares the output budget with the answer, so both
-# MAX_TOKENS settings are sized for that. Disable per request with enable_thinking:false,
-# or per user with the bot's /think toggle.
+# Measured on this box, same prompt, warmed up (so this excludes graph build and prefill):
+#              resident    peak     decode      TTFT
+#   Bonsai 2   7.15 GiB   7.74 GiB  18.0 tok/s  0.57s
+#   AEON 4bit  14.09 GiB  14.37 GiB 15.5 tok/s  0.87s
+# Half the memory AND faster. The obvious suspicion — that running the Hadamard rotation as
+# ordinary MLX ops instead of Prism's fused kernel (their MLX fork) costs us real speed — was
+# measured and is WRONG: bypassing the rotation entirely buys 3.5% at decode and nothing at
+# prefill. Adopting that fork means replacing core mlx for 3.5%; don't.
+# What actually caps decode is MLX's 2-bit/group-128 quantized_matmul. Isolated at batch 1 it
+# reaches 52.9 GB/s where 4-bit/group-64 reaches 237 GB/s on the same hardware; in the model,
+# pipelining lifts it to ~133 GB/s effective, 49% of this M4 Pro's 273 GB/s, against the 80%
+# the old 4-bit build achieved. That gap is in MLX's kernel, not in anything here, and it does
+# not respond to mx.compile (measured: 0%). Group 64 benchmarks 2.3x better than group 128 at
+# the same bit width, but every published Bonsai 27B pack is group 128, so there is nothing to
+# switch to. Revisit if MLX improves its low-bit kernels — that is the one thing that would
+# move this number.
+#
+# WHAT THIS COST US: the previous build was choppedgarlic/Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED,
+# picked deliberately for being uncensored. Bonsai 2 is a straight quantization of *stock*
+# Qwen3.8-27B, so the alignment is back. The bot's system prompt in deploy/service.env still
+# asks for candid, unhedged answers and mostly gets them, but this model will refuse where the
+# AEON build would not. That was a known, accepted trade for the memory and the 98.2%
+# benchmark retention — not an oversight. An uncensored MLX Bonsai 2 exists
+# (dealignai/Bonsai-2-27B-CRACK-Ternary-JANG) but is days old, near-zero downloads, and
+# packed in a different format that this loader does not read.
+engine = "mlx_prism"
+# REQUIRED, not a preference. These packs declare model_type "prism_hadamard_qwen35"; mlx-lm
+# resolves architectures by importing mlx_lm.models.<model_type> and has no such module, so
+# mlx_lm.load raises outright. Even if it resolved, the Hadamard rotation lives in the forward
+# pass, not the checkpoint — see src/mlx_lazyserve/prism.py, which vendors the transform.
+# 256k: this build's native max_position_embeddings, with rope_type still "default" — no YaRN,
+# no extrapolation, just the window the model was trained for. Reachable only because the
+# weights dropped 7 GiB; under the 14.2 GiB build this did not fit.
+# KV cost was MEASURED here rather than inherited, by prefilling 4k and 16k and taking the
+# slope so the fixed state cancels — the old comment's ~32 KiB/token was the raw geometry
+# (16 full-attention layers of 64 at interval 4, 4 KV heads x 256 head_dim, 1 byte at 8-bit)
+# and undercounted: 8-bit KV also stores a scale and a bias per group.
+#   measured: 36.00 KiB/token + 158 MiB fixed recurrent state  (that 158 matches the ~155 MB
+#             already assumed by _PrefixCache.MIN_REUSE, arrived at independently)
+#   128k  -> 4.65 GiB KV + 7.15 GiB weights = 11.81 GiB
+#   256k  -> 9.15 GiB KV                    = 16.31 GiB  <- here, 5.2 GiB under the wired limit
+# Why this is safe where 192k on the old build was not: what broke last time was not the wired
+# limit, it was everything ELSE on a 24 GiB box getting squeezed. The old 128k config left the
+# system 5.8 GiB and still swapped at 72% of 4 GiB. This leaves 7.7 GiB — more headroom than
+# the configuration that misbehaved, at twice the window.
+# The real cost of 256k is TIME, not memory — and it is worse than a flat rate suggests,
+# because attention is quadratic so BOTH prefill and decode degrade with depth. Measured:
+#     ctx      KV        prefill      decode
+#     4k     0.29 GiB   88.4 tok/s   16.94 tok/s
+#    16k     0.71       82.1         13.53
+#    32k     1.28       73.9         11.17
+#    64k     2.40       58.1          7.21
+# An early estimate here said a full 256k window costs ~56 minutes of prefill. That was wrong:
+# it took the shallow-context rate as a constant. Extrapolating the measured curve (32k->64k
+# prefill time went 443s -> 1128s, 2.55x for 2x the tokens) puts a cold full window nearer
+# ~2 HOURS, with decode down around 3 tok/s once you are out there.
+# This is not an argument against the 256k ceiling — an available window costs nothing until
+# you fill it, and the memory for it is verified. It is an argument for knowing where the
+# usable knee is, which on this box is somewhere under 32k. The prefix cache is what makes
+# long multi-turn sessions tolerable; a cold 256k prompt is not something to do casually.
+context = 262144
+# Thinking ON by default on both surfaces, unchanged — same Qwen3.5-style chat template, same
+# <think> block, same per-request enable_thinking / bot /think overrides. Verified against this
+# pack's own chat_template.jinja rather than assumed.
 enable_thinking = true       # API default
 tg_enable_thinking = true    # Telegram-bot default
+# Loading this pack prints two transformers warnings. Both are noise, checked rather than
+# waved off:
+#   "model of type prism_hadamard_qwen35 to instantiate a model of type ``" — AutoConfig has
+#     no mapping for the custom type. We never use AutoModel, so nothing downstream cares.
+#   "incorrect regex pattern ... will lead to incorrect tokenization" — the pack's tokenizer
+#     was rebuilt from the source GGUF, so its pre_tokenizer, decoder and merges differ from
+#     the original. The vocab is identical, and a differential encode against the old build
+#     over English, Chinese, code, whitespace-heavy text, markdown, currency and ZWJ emoji
+#     came back token-for-token identical on every sample. Cosmetic here.

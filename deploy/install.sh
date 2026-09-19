@@ -69,6 +69,7 @@ cat > "$PLIST" <<PLIST
         <key>MLX_LAZYSERVE_API_KEYS</key><string>${MLX_LAZYSERVE_API_KEYS:-}</string>
         <key>MLX_LAZYSERVE_TG_BOT_TOKEN</key><string>${MLX_LAZYSERVE_TG_BOT_TOKEN:-}</string>
         <key>MLX_LAZYSERVE_TG_MODEL</key><string>${MLX_LAZYSERVE_TG_MODEL:-}</string>
+        <key>MLX_LAZYSERVE_TG_THINK_BUDGET</key><string>${MLX_LAZYSERVE_TG_THINK_BUDGET:-0}</string>
         <key>MLX_LAZYSERVE_TG_SYSTEM_PROMPT</key><string>${MLX_LAZYSERVE_TG_SYSTEM_PROMPT:-}</string>
         <key>MLX_LAZYSERVE_TG_MAX_TOKENS</key><string>${MLX_LAZYSERVE_TG_MAX_TOKENS:-}</string>
         <key>MLX_LAZYSERVE_TG_KV_BITS</key><string>${MLX_LAZYSERVE_TG_KV_BITS:-4}</string>

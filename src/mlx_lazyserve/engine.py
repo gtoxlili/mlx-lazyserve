@@ -28,6 +28,13 @@ from types import SimpleNamespace
 
 logger = logging.getLogger(__name__)
 
+# mlx-lm defaults prompt chunking to 2048. Measured on this box over a 6000-token prefill:
+#   512 -> 89.7 tok/s   2048 -> 86.5   4096 -> 84.2   8192 -> 70.6
+# Prefill here is compute-bound at ~86% of the M4 Pro's 5.37 TFLOP/s, so this is the only
+# prefill knob that does anything at all, and it is worth +3.7%. mlx-lm's own speculative
+# decoding path already defaults to 512, so this is not an exotic value.
+PREFILL_STEP_SIZE = 512
+
 _FIM_MARKERS = (
     "<|fim_prefix|>",
     "<|fim_middle|>",
@@ -364,8 +371,10 @@ class _PrefixCache:
     Not thread-safe by design: ``ModelManager`` serializes generation behind its lock.
     """
 
-    MIN_REUSE = 256  # a snapshot costs ~155 MB of fixed recurrent state; earn it first
-    MAX_SNAPSHOT = 65536  # ~2 GiB at 8-bit KV — past here the file is worse than the prefill
+    MIN_REUSE = 256  # a snapshot costs 158 MiB of fixed recurrent state (measured); earn it first
+    MAX_SNAPSHOT = 65536  # 2.4 GiB at 8-bit KV (36.00 KiB/tok measured, plus the fixed state) —
+    # past here the file is worse than the prefill. Deliberately NOT raised with the 256k window:
+    # this bounds snapshot SIZE, and a bigger window does not make a bigger file cheaper to write.
 
     def __init__(self) -> None:
         self._dir: str | None = None
@@ -466,6 +475,7 @@ def _prefill(model, cache, ids, kv_bits: int) -> None:
     from mlx_lm.generate import generate_step
 
     kw = {"kv_bits": int(kv_bits)} if kv_bits else {}
+    kw["prefill_step_size"] = PREFILL_STEP_SIZE
     for _ in generate_step(mx.array(list(ids)), model, max_tokens=0, prompt_cache=cache, **kw):
         pass  # yields nothing; the work is the prefill itself
 
@@ -620,6 +630,85 @@ def _build_logits_processors(
     return procs or None
 
 
+def _thinking_budget_processor(tokenizer, budget: int, enable_thinking: bool, prompt: str):
+    """Cap the ``<think>`` block at ``budget`` tokens, or None if not applicable.
+
+    The state machine is mlx-vlm's ``ThinkingBudgetCriteria`` — the same source this module
+    already borrows ``ThinkingStreamState`` and the tool parsers from — not a reimplementation.
+    What has to be adapted is how it is *driven*. mlx-vlm owns its generation loop and simply
+    overwrites the next token (``next_y = mx.array([forced_token_id])``). mlx-lm's
+    ``generate_step`` exposes no such hook: its only per-token callbacks are ``sampler`` and
+    ``logits_processors``, so the forced token has to be imposed by collapsing the
+    distribution onto it instead of by assignment.
+
+    The criteria's contract is "here is the token just produced, here is the one to force
+    next", which lines up exactly with a logits processor: it is handed the tokens so far and
+    returns the logits the next token is sampled from.
+    """
+    if not enable_thinking or budget <= 0:
+        return None
+    try:
+        from mlx_vlm.utils import ThinkingBudgetCriteria
+    except Exception as exc:  # core-only install — same graceful degradation as _parse_events
+        logger.warning("thinking budget unavailable (%s); reasoning left uncapped", exc)
+        return None
+
+    hf_tok = getattr(tokenizer, "_tokenizer", None) or getattr(
+        tokenizer, "tokenizer", tokenizer
+    )
+    start = getattr(tokenizer, "think_start", None) or "<think>"
+    end = getattr(tokenizer, "think_end", None) or "</think>"
+    # This template opens the block in the prompt itself ("...<think>\n"), so generation
+    # starts already inside it and the criteria must be told, or it counts nothing.
+    # apply_chat_template hands back either text or token ids depending on the model.
+    if isinstance(prompt, str):
+        preopened = prompt.rfind(start) > prompt.rfind(end)
+    else:
+        ids = list(prompt)
+
+        def _last(tok):
+            tid = hf_tok.encode(tok, add_special_tokens=False)[-1]
+            return len(ids) - 1 - ids[::-1].index(tid) if tid in ids else -1
+
+        preopened = _last(start) > _last(end)
+    try:
+        criteria = ThinkingBudgetCriteria(
+            tokenizer=hf_tok,
+            thinking_budget=int(budget),
+            thinking_end_token=end,
+            thinking_start_token=start,
+            enable_thinking=True,
+            prompt_preopens_thinking=preopened,
+        )
+    except Exception as exc:
+        logger.warning("thinking budget setup failed (%s); reasoning left uncapped", exc)
+        return None
+
+    import mlx.core as mx
+
+    state = {"anchor": None}
+
+    def processor(tokens, logits):
+        # First call lands on the prompt tail; feeding those to the criteria would let a
+        # *historical* </think> in the conversation flip its state. Anchor, then feed only
+        # what generation appends — one token per call from here on.
+        if state["anchor"] is None:
+            state["anchor"] = tokens.size
+            return logits
+        if tokens.size <= state["anchor"]:
+            return logits
+        criteria(int(tokens[-1].item()))
+        forced = criteria.pop_forced_token_id()
+        if forced is None:
+            return logits
+        # Keep the forced token's own logit and bury everything else: after logsumexp this is
+        # a point mass, so it survives whatever top_k/top_p the caller asked for.
+        idx = mx.arange(logits.shape[-1])
+        return mx.where(idx == forced, logits, -mx.inf)
+
+    return processor
+
+
 def _build_structured(hf_tokenizer, response_format):
     """An llguidance logits processor enforcing OpenAI ``response_format``, or None.
 
@@ -717,13 +806,22 @@ def _raw_with_kv_fallback(make_gen, gen_kw, usage) -> Iterator[str]:
 
 
 class MlxLmModel:
-    """Text LLMs via mlx-lm."""
+    """Text LLMs via mlx-lm.
 
-    def __init__(self, repo: str) -> None:
-        from mlx_lm import load
+    ``loader`` swaps only how the weights are materialized, keeping the whole generation
+    path — sampler, prefix cache, tool parser, KV fallback — identical. Prism "Bonsai"
+    ternary packs need their own loader (see :mod:`mlx_lazyserve.prism`) because the
+    Hadamard rotation lives in the forward pass, but what it returns is a stock
+    ``mlx_lm.models.qwen3_5.TextModel`` plus the usual tokenizer wrapper, so nothing
+    downstream of this line has to know the difference.
+    """
+
+    def __init__(self, repo: str, loader=None) -> None:
+        if loader is None:
+            from mlx_lm import load as loader
 
         self.repo = repo
-        self.model, self.tokenizer = load(repo)
+        self.model, self.tokenizer = loader(repo)
         self._prefix = _PrefixCache()
         hf_tok = getattr(self.tokenizer, "_tokenizer", self.tokenizer)
         self._blocked_token_ids = _fim_token_ids(hf_tok)
@@ -788,6 +886,7 @@ class MlxLmModel:
         loop_guard=True,
         max_prompt_tokens=None,
         context=0,
+        think_budget=0,
     ) -> Iterator[dict]:
         if images:
             raise ValueError(
@@ -812,6 +911,7 @@ class MlxLmModel:
         gen_kw = {
             "max_tokens": max_tokens,
             "sampler": _build_sampler(temperature, top_p, top_k, min_p),
+            "prefill_step_size": PREFILL_STEP_SIZE,
         }
         if processors:
             gen_kw["logits_processors"] = processors
@@ -826,6 +926,15 @@ class MlxLmModel:
                 max_prompt_tokens,
             )
             run_kw = _fit_output(gen_kw, self._prompt_token_len(prompt), context)
+            budget_proc = _thinking_budget_processor(
+                self.tokenizer, think_budget, thinking, prompt
+            )
+            if budget_proc is not None:
+                # Last, so nothing downstream can re-open the distribution once the cap fires.
+                run_kw["logits_processors"] = [
+                    *run_kw.get("logits_processors", []),
+                    budget_proc,
+                ]
             _apply_seed(seed)
             usage: dict = {}
             # Only token-id prompts can be prefix-matched; a templated string would have to
@@ -991,6 +1100,7 @@ class MlxVlmModel:
         loop_guard=True,
         max_prompt_tokens=None,
         context=0,
+        think_budget=0,
     ) -> Iterator[dict]:
         from mlx_vlm import stream_generate
 
@@ -1031,6 +1141,18 @@ class MlxVlmModel:
                 max_prompt_tokens,
             )
             run_kw = _fit_output(gen_kw, self._prompt_token_len(prompt), context)
+            budget_proc = _thinking_budget_processor(
+                getattr(self.processor, "tokenizer", self.processor),
+                think_budget,
+                thinking,
+                prompt,
+            )
+            if budget_proc is not None:
+                # Last, so nothing downstream can re-open the distribution once the cap fires.
+                run_kw["logits_processors"] = [
+                    *run_kw.get("logits_processors", []),
+                    budget_proc,
+                ]
             _apply_seed(seed)
             usage: dict = {}
 
@@ -1062,6 +1184,14 @@ class MlxVlmModel:
 
 def load_model(spec) -> MlxLmModel | MlxVlmModel:
     """Instantiate the right engine for a ModelSpec, with auto-fallback."""
+    if spec.engine == "mlx_prism":
+        # Deliberately not reachable from "auto": these packs are text-only and stock
+        # mlx-lm cannot load them at all, so an auto-fallback would only ever turn a
+        # clear "wrong engine" into a confusing mlx-vlm error.
+        from . import prism
+
+        logger.info("loading %s via the prism ternary runtime", spec.repo)
+        return MlxLmModel(spec.repo, loader=prism.load)
     if spec.engine in ("mlx_lm", "auto"):
         try:
             logger.info("loading %s via mlx-lm", spec.repo)

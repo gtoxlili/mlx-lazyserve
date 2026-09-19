@@ -51,8 +51,23 @@ MAX_MESSAGE_LEN = 4000  # < Telegram's 4096 hard cap (UTF-16 units), with headro
 ACK_REACTION = "👀"  # reaction set on the triggering message while we think
 STREAM_INTERVAL = 1.0  # min seconds between edits of the live message (Telegram throttles ~1/s)
 STREAM_BACKOFF = 2.0  # multiply the interval by this after a rejected edit, up to STREAM_MAX
-STREAM_MAX_INTERVAL = 8.0
+STREAM_MAX_INTERVAL = 8.0  # ceiling for the *self-chosen* backoff; a 429 overrides it
+RETRY_AFTER_CAP = 60.0  # longest we'll honour a 429's retry_after before giving up
 PROMPT_MARGIN = 256  # tokens held back from the context window (template/counting slack)
+POLL_RESET_AFTER = 3  # consecutive getUpdates failures before the HTTP client is rebuilt
+
+
+def _system_proxy() -> str:
+    """The proxy httpx would pick up right now — logged so a wrong one is visible.
+
+    httpx reads this once, when the client is constructed, and never again.
+    """
+    try:
+        import urllib.request
+
+        return urllib.request.getproxies().get("https") or "none"
+    except Exception:  # pragma: no cover - platform-dependent
+        return "unknown"
 
 
 class TelegramAPIError(RuntimeError):
@@ -62,8 +77,13 @@ class TelegramAPIError(RuntimeError):
     token, 404 malformed token) from a transient one (429 rate-limit, 5xx).
     """
 
-    def __init__(self, method: str, description, error_code: int | None) -> None:
+    def __init__(
+        self, method: str, description, error_code: int | None, retry_after: float | None = None
+    ) -> None:
         self.error_code = error_code
+        # 429 answers carry parameters.retry_after — the exact wait Telegram wants. Ignoring
+        # it is how a chat's rate budget gets burned and a reply ends up never sent.
+        self.retry_after = retry_after
         super().__init__(f"{method}: {description} (code {error_code})")
 
 
@@ -314,7 +334,8 @@ class TelegramBot:
             )
             return
         try:
-            import httpx
+            # Presence check only — the client itself is built in _new_client().
+            import httpx  # noqa: F401
         except ImportError:
             logger.error(
                 "Telegram bot enabled but deps missing — install the 'telegram' extra "
@@ -338,9 +359,9 @@ class TelegramBot:
             except Exception as exc:
                 logger.warning("could not open history DB (%s); using in-memory history", exc)
                 self._store = None
-        timeout = httpx.Timeout(LONG_POLL_TIMEOUT + 15.0, connect=10.0)
-        async with httpx.AsyncClient(base_url=API_BASE, timeout=timeout) as client:
-            self._client = client
+        self._client = self._new_client()
+        logger.info("Telegram HTTP client ready (proxy=%s)", _system_proxy())
+        try:
             me = await self._getme_with_retry(stop)
             if me is None:
                 logger.info("Telegram bot disabled (stopped before getMe succeeded)")
@@ -384,6 +405,8 @@ class TelegramBot:
                 self._abort_all()
                 if self._fc is not None:
                     await self._fc.aclose()
+        finally:
+            await self._close_client()
         logger.info("Telegram bot stopped")
 
     def _abort_all(self) -> None:
@@ -428,14 +451,23 @@ class TelegramBot:
                         exc,
                     )
                     return None
-                logger.warning("Telegram getMe failed (%s); retrying in %.0fs", exc, backoff)
+                logger.warning(
+                    "Telegram getMe failed (%s: %s); retrying in %.0fs",
+                    type(exc).__name__, exc or "no detail", backoff,
+                )
                 await self._sleep_or_stop(stop, backoff)
                 backoff = min(backoff * 2, 30.0)
+                # At boot this usually means the network (or the proxy this box routes
+                # Telegram through) is not up yet. Rebuild AFTER the wait, so the client
+                # that finally succeeds is one constructed once the proxy existed.
+                if not stop.is_set():
+                    await self._reset_client("getMe retry")
         return None
 
     async def _poll_loop(self, stop: asyncio.Event) -> None:
         offset: int | None = None
         backoff = 1.0
+        failures = 0
         while not stop.is_set():
             try:
                 updates = await self._api(
@@ -447,10 +479,22 @@ class TelegramBot:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning("getUpdates failed (%s); retrying in %.0fs", exc, backoff)
+                failures += 1
+                # Name the exception type. httpx's timeouts carry an EMPTY message, so the
+                # old "%s" logged a bare "getUpdates failed ()" — which is how this ran
+                # broken for a week without anyone being able to tell what was wrong.
+                logger.warning(
+                    "getUpdates failed (%s: %s); retrying in %.0fs",
+                    type(exc).__name__, exc or "no detail", backoff,
+                )
+                # A client whose pool or proxy routing has gone bad never recovers on its
+                # own — every later poll fails the same way forever. Rebuild it.
+                if failures % POLL_RESET_AFTER == 0:
+                    await self._reset_client(f"{failures} consecutive getUpdates failures")
                 await self._sleep_or_stop(stop, backoff)
                 backoff = min(backoff * 2, 30.0)
                 continue
+            failures = 0
             backoff = 1.0
             for update in updates or []:
                 offset = update["update_id"] + 1
@@ -920,8 +964,16 @@ class TelegramBot:
             chan.history.extend(turn)
             self._trim_history(chan)
             await self._persist(chat_id, user_id, turn)
-            await stream.drop()  # the fully rendered send below replaces it
-            await self._send_reply(chat_id, text, reasoning, reply_to)
+            # Send BEFORE dropping the live message. Dropping first means a send that fails
+            # (a flood limit at exactly the wrong moment) leaves the user with a deleted
+            # bubble and no answer at all. A brief duplicate is the cheaper failure.
+            if await self._send_reply(chat_id, text, reasoning, reply_to):
+                await stream.drop()
+            else:
+                logger.error(
+                    "final send failed for %s; keeping the streamed message as the answer",
+                    reply_to,
+                )
 
     def _compose_turn(self, msg: Incoming, chan: Channel) -> str:
         """The user's text, prefixed by whatever message it was replying to."""
@@ -1016,6 +1068,10 @@ class TelegramBot:
             "top_p": 0.95,
             "top_k": self.settings.tg_top_k or None,
             "enable_thinking": enable_thinking,
+            # Cap the <think> block. Reasoning shares the output budget with the answer and
+            # costs real wall-clock at this box's decode rate, so an unbounded ramble is paid
+            # for twice: once waiting, once in a reply that arrives late. 0 = uncapped.
+            "think_budget": self.settings.tg_think_budget,
             # Bot KV is quantized harder than the API (default 4-bit vs 8): chats are frequent
             # and short, so the smaller cache trims memory/bandwidth at a tiny quality cost.
             "kv_bits": self.settings.tg_kv_bits,
@@ -1268,7 +1324,7 @@ class TelegramBot:
             return f"{quoted}\n\n{text}" if text else quoted
         return text
 
-    async def _send_reply(self, chat_id, text: str, reasoning: str, reply_to: int) -> None:
+    async def _send_reply(self, chat_id, text: str, reasoning: str, reply_to: int) -> bool:
         md = self._compose_markdown(text, reasoning)
         rp = {"message_id": reply_to, "allow_sending_without_reply": True}
         try:
@@ -1283,20 +1339,20 @@ class TelegramBot:
             )
         except Exception as exc:
             logger.warning("telegramify failed (%s); sending plain text", exc)
-            await self._send_plain(chat_id, text, reply_to)
-            return
+            return await self._send_plain(chat_id, text, reply_to)
         if not items:
-            await self._send_plain(chat_id, text, reply_to)
-            return
+            return await self._send_plain(chat_id, text, reply_to)
+        ok = True
         for i, item in enumerate(items):
-            await self._send_item(chat_id, item, ContentType, rp if i == 0 else None)
+            ok = await self._send_item(chat_id, item, ContentType, rp if i == 0 else None) and ok
+        return ok
 
-    async def _send_item(self, chat_id, item, content_type, reply_parameters) -> None:
+    async def _send_item(self, chat_id, item, content_type, reply_parameters) -> bool:
         ct = item.content_type
         if ct == content_type.TEXT:
             entities = [e.to_dict() for e in (item.entities or [])]
             try:
-                await self._api(
+                await self._api_retrying(
                     "sendMessage",
                     chat_id=chat_id,
                     text=item.text,
@@ -1304,34 +1360,48 @@ class TelegramBot:
                     reply_parameters=reply_parameters,
                     link_preview_options={"is_disabled": True},
                 )
+                return True
             except Exception as exc:
                 logger.warning("sendMessage(entities) failed (%s); retrying as plain text", exc)
-                await self._api_quiet(
+            try:
+                await self._api_retrying(
                     "sendMessage",
                     chat_id=chat_id,
                     text=item.text,
                     reply_parameters=reply_parameters,
                     link_preview_options={"is_disabled": True},
                 )
+                return True
+            except Exception as exc:
+                logger.error("plain-text fallback failed too (%s); reply not delivered", exc)
+                return False
         elif ct == content_type.PHOTO:
-            await self._send_media("sendPhoto", "photo", chat_id, item, reply_parameters)
+            return await self._send_media("sendPhoto", "photo", chat_id, item, reply_parameters)
         elif ct == content_type.FILE:
-            await self._send_media("sendDocument", "document", chat_id, item, reply_parameters)
+            return await self._send_media(
+                "sendDocument", "document", chat_id, item, reply_parameters
+            )
         else:  # RICH or any future type: degrade to plain text rather than dropping it
             txt = getattr(item, "text", None)
-            if txt:
-                await self._api_quiet(
+            if not txt:
+                return True
+            try:
+                await self._api_retrying(
                     "sendMessage",
                     chat_id=chat_id,
                     text=txt,
                     reply_parameters=reply_parameters,
                     link_preview_options={"is_disabled": True},
                 )
+                return True
+            except Exception as exc:
+                logger.error("sendMessage failed (%s); reply not delivered", exc)
+                return False
 
-    async def _send_media(self, method, field_name, chat_id, item, reply_parameters) -> None:
+    async def _send_media(self, method, field_name, chat_id, item, reply_parameters) -> bool:
         file_data = getattr(item, "file_data", None)
         if file_data is None:
-            return
+            return True
         data = {"chat_id": str(chat_id)}
         caption = getattr(item, "caption_text", None)
         if caption:
@@ -1347,23 +1417,31 @@ class TelegramBot:
             payload = resp.json()
             if not payload.get("ok"):
                 raise RuntimeError(payload.get("description"))
+            return True
         except Exception as exc:
             logger.warning("%s failed (%s)", method, exc)
+            return False
 
-    async def _send_plain(self, chat_id, text: str, reply_to: int | None = None) -> None:
+    async def _send_plain(self, chat_id, text: str, reply_to: int | None = None) -> bool:
+        ok = True
         for i, chunk in enumerate(self._split_plain(text, MAX_MESSAGE_LEN)):
             rp = (
                 {"message_id": reply_to, "allow_sending_without_reply": True}
                 if reply_to and i == 0
                 else None
             )
-            await self._api_quiet(
-                "sendMessage",
-                chat_id=chat_id,
-                text=chunk,
-                reply_parameters=rp,
-                link_preview_options={"is_disabled": True},
-            )
+            try:
+                await self._api_retrying(
+                    "sendMessage",
+                    chat_id=chat_id,
+                    text=chunk,
+                    reply_parameters=rp,
+                    link_preview_options={"is_disabled": True},
+                )
+            except Exception as exc:
+                logger.warning("sendMessage failed (%s)", exc)
+                ok = False
+        return ok
 
     @staticmethod
     def _split_plain(text: str, limit: int) -> list[str]:
@@ -1433,9 +1511,16 @@ class TelegramBot:
                     link_preview_options={"is_disabled": True},
                 )
                 self.mid = (sent or {}).get("message_id")
-            elif not await self.bot._stream_edit(self.chat_id, self.mid, text):
-                self.interval = min(self.interval * STREAM_BACKOFF, STREAM_MAX_INTERVAL)
-                return
+            else:
+                cooldown = await self.bot._stream_edit(self.chat_id, self.mid, text)
+                if cooldown is not None:
+                    # Never back off less than Telegram asked for. The old fixed doubling
+                    # capped at 8s kept hammering a 25s flood limit, which starved the chat's
+                    # rate budget and left nothing for the final send.
+                    self.interval = max(
+                        min(self.interval * STREAM_BACKOFF, STREAM_MAX_INTERVAL), cooldown
+                    )
+                    return
             self.shown = text
 
         async def drop(self) -> None:
@@ -1445,8 +1530,12 @@ class TelegramBot:
                                           message_id=self.mid)
                 self.mid = None
 
-    async def _stream_edit(self, chat_id: int, mid: int, text: str) -> bool:
-        """Rewrite the live message. Returns False when Telegram refused the edit."""
+    async def _stream_edit(self, chat_id: int, mid: int, text: str) -> float | None:
+        """Rewrite the live message.
+
+        Returns None when the edit landed, else the number of seconds Telegram wants us to
+        wait (0.0 when it refused for a non-rate reason, e.g. half-written markup).
+        """
         from telegramify_markdown import markdownify
 
         try:
@@ -1462,13 +1551,28 @@ class TelegramBot:
                 parse_mode="MarkdownV2",
                 link_preview_options={"is_disabled": True},
             )
-            return True
+            return None
         except Exception as exc:
             # "message is not modified" is routine (nothing new since the last edit) and is
             # not worth logging; anything else means we should slow down.
             if "not modified" not in str(exc):
                 logger.info("stream edit rejected: %s", exc)
-            return False
+            # A half-written spoiler/entity makes Telegram reject the *markup*, not the rate.
+            # Re-send this frame unformatted so streaming keeps moving instead of stalling
+            # until the generation ends.
+            if "can't parse entities" in str(exc):
+                try:
+                    await self._api(
+                        "editMessageText",
+                        chat_id=chat_id,
+                        message_id=mid,
+                        text=text,
+                        link_preview_options={"is_disabled": True},
+                    )
+                    return None
+                except Exception:
+                    pass
+            return float(getattr(exc, "retry_after", None) or 0.0)
 
     async def _typing_loop(self, chat_id, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -1476,6 +1580,41 @@ class TelegramBot:
             await self._sleep_or_stop(stop, TYPING_INTERVAL)
 
     # ------------------------------------------------------------------ HTTP
+
+    def _new_client(self):
+        """A fresh client — and with it, a fresh reading of the proxy settings.
+
+        This matters more than it looks. httpx resolves the environment/system proxy once,
+        at construction, and keeps that decision for the client's whole life. This bot is a
+        LaunchAgent that starts at boot and regularly WINS the race against the proxy it is
+        supposed to reach Telegram through, so the client can be built in a window where
+        there is no proxy yet and then keep that wrong routing until the process is
+        restarted by hand. Rebuilding is what lets it recover on its own.
+        """
+        import httpx
+
+        return httpx.AsyncClient(
+            base_url=API_BASE, timeout=httpx.Timeout(LONG_POLL_TIMEOUT + 15.0, connect=10.0)
+        )
+
+    async def _reset_client(self, why: str) -> None:
+        """Swap in a new client and retire the old one. In-flight calls on it will fail —
+        they were already failing, which is why we are here."""
+        logger.warning("rebuilding Telegram HTTP client (%s); proxy=%s", why, _system_proxy())
+        old, self._client = self._client, self._new_client()
+        if old is not None:
+            try:
+                await old.aclose()
+            except Exception:
+                pass
+
+    async def _close_client(self) -> None:
+        client, self._client = self._client, None
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
     async def _api(self, method: str, **params):
         payload = {k: v for k, v in params.items() if v is not None}
@@ -1485,8 +1624,31 @@ class TelegramBot:
         except Exception:
             raise RuntimeError(f"{method}: HTTP {resp.status_code}")
         if not data.get("ok"):
-            raise TelegramAPIError(method, data.get("description"), data.get("error_code"))
+            raise TelegramAPIError(
+                method,
+                data.get("description"),
+                data.get("error_code"),
+                (data.get("parameters") or {}).get("retry_after"),
+            )
         return data.get("result")
+
+    async def _api_retrying(self, method: str, _attempts: int = 3, **params):
+        """``_api``, but waits out a flood limit instead of failing the call.
+
+        Only for calls whose loss the user would notice (the reply itself). Telegram hands
+        back the exact number of seconds to wait; sleeping it out turns a dropped answer into
+        a late one. Polling deliberately does NOT use this — it has its own backoff.
+        """
+        for attempt in range(_attempts):
+            try:
+                return await self._api(method, **params)
+            except TelegramAPIError as exc:
+                wait = exc.retry_after
+                if not wait or attempt == _attempts - 1 or wait > RETRY_AFTER_CAP:
+                    raise
+                logger.info("%s flood-limited; waiting %ss", method, wait)
+                await asyncio.sleep(wait + 1.0)
+        return None
 
     async def _api_quiet(self, method: str, **params):
         try:

@@ -20,9 +20,20 @@ Configured in [`models.toml`](models.toml); weights download lazily into `~/.cac
 
 | name | repo | size |
 |---|---|---|
-| `qwen3.8-27b` (default) | `choppedgarlic/Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-4bit-MLX` | ~15 GB |
+| `qwen3.8-27b` (default) | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` | ~7.2 GB resident |
 
 Edit `models.toml` to add your own; any MLX repo on Hugging Face works.
+
+### Prism "Bonsai" ternary packs
+
+The default model is a ternary (~1.72 bits/weight) pack, which stock mlx-lm cannot load:
+it declares `model_type: prism_hadamard_qwen35`, and the Hadamard rotation those weights
+were packed against lives in the forward pass rather than in the checkpoint. Set
+`engine = "mlx_prism"` for these; [`src/mlx_lazyserve/prism.py`](src/mlx_lazyserve/prism.py)
+vendors the transform (upstream ships an equivalent loader inside the pack itself, but it
+rejects the `schema_version` its own packs carry). Everything downstream — sampler, prefix
+cache, tool parsing — is the ordinary mlx-lm path. Text-only: the vision tower in schema-v2
+packs is dropped on load.
 
 ## Requirements
 

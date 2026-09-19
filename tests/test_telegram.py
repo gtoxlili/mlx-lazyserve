@@ -1,6 +1,9 @@
+import asyncio
+import types
 import unittest
+from unittest import mock
 
-from mlx_lazyserve.telegram import Channel, Incoming, TelegramBot
+from mlx_lazyserve.telegram import Channel, Incoming, TelegramAPIError, TelegramBot
 
 BOT_ID = 999
 
@@ -268,11 +271,11 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
 
         async def stream_edit(chat_id, mid, text):
             self.calls.append(("edit", {"text": text}))
-            return self.edit_ok
+            return self.edit_cooldown
 
         b._api_quiet = api_quiet
         b._stream_edit = stream_edit
-        self.edit_ok = True
+        self.edit_cooldown = None      # None = the edit landed
         return TelegramBot._Stream(b, -100, 5)
 
     async def test_the_first_push_sends_a_message(self):
@@ -305,11 +308,21 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         st = self.make()
         await st.push("一")
         st.last = 0.0
-        self.edit_ok = False
+        self.edit_cooldown = 0.0       # refused, but not for a rate reason
         before = st.interval
         await st.push("一二")
         self.assertGreater(st.interval, before)
         self.assertEqual(st.shown, "一")   # not recorded as shown, so it retries later
+
+    async def test_a_flood_limit_widens_the_interval_to_what_telegram_asked_for(self):
+        # The old backoff doubled 1s -> 8s and stopped there, so a "retry after 25" was
+        # ignored and the bot kept hammering — burning the rate budget the FINAL send needs.
+        st = self.make()
+        await st.push("一")
+        st.last = 0.0
+        self.edit_cooldown = 25.0
+        await st.push("一二")
+        self.assertGreaterEqual(st.interval, 25.0)
 
     async def test_outgrowing_one_message_stops_streaming(self):
         # Past Telegram's per-message limit the live preview gives up and the final,
@@ -330,3 +343,208 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         st = self.make()
         await st.drop()
         self.assertEqual(self.calls, [])
+
+
+class SendDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    """Whether a reply actually reached Telegram has to be *reportable*, because the caller
+    deletes the streamed message once the real send lands. A send that fails silently is how
+    a user ends up with the thinking bubble deleted and no answer at all."""
+
+    class CT:  # stands in for telegramify_markdown's ContentType
+        TEXT, PHOTO, FILE = "text", "photo", "file"
+
+    def item(self, text="hi"):
+        return types.SimpleNamespace(content_type=self.CT.TEXT, text=text, entities=None)
+
+    async def test_a_delivered_item_reports_success(self):
+        b = bot()
+
+        async def ok(method, **kw):
+            return {"message_id": 1}
+
+        b._api_retrying = ok
+        self.assertTrue(await b._send_item(1, self.item(), self.CT, None))
+
+    async def test_an_item_no_route_can_deliver_reports_failure(self):
+        # Both the entity send and the plain-text fallback refused: the answer is lost, and
+        # the caller must learn that so it keeps the streamed message on screen.
+        b = bot()
+
+        async def boom(method, **kw):
+            raise TelegramAPIError(method, "Too Many Requests", 429, 13)
+
+        b._api_retrying = boom
+        with self.assertLogs("mlx_lazyserve.telegram", level="WARNING"):
+            self.assertFalse(await b._send_item(1, self.item(), self.CT, None))
+
+    async def test_the_plain_text_fallback_still_counts_as_delivered(self):
+        b = bot()
+        seen = []
+
+        async def once(method, **kw):
+            seen.append(kw.get("entities", "none"))
+            if "entities" in kw and kw["entities"] is not None:
+                raise TelegramAPIError(method, "can't parse entities", 400)
+            return {"message_id": 1}
+
+        b._api_retrying = once
+        it = self.item()
+        it.entities = [types.SimpleNamespace(to_dict=lambda: {"type": "bold"})]
+        with self.assertLogs("mlx_lazyserve.telegram", level="WARNING"):
+            self.assertTrue(await b._send_item(1, it, self.CT, None))
+
+
+class FloodWaitTests(unittest.IsolatedAsyncioTestCase):
+    """A 429 hands back the exact number of seconds to wait. Honouring it turns a dropped
+    reply into a late one."""
+
+    def bot_with(self, outcomes):
+        b = bot()
+        self.attempts = []
+
+        async def api(method, **kw):
+            self.attempts.append(method)
+            out = outcomes.pop(0)
+            if out is not None:
+                raise out
+            return {"message_id": 1}
+
+        b._api = api
+        return b
+
+    async def test_a_flood_limit_is_waited_out_then_retried(self):
+        b = self.bot_with([TelegramAPIError("sendMessage", "Too Many Requests", 429, 13), None])
+        slept = []
+
+        async def fake_sleep(secs):
+            slept.append(secs)
+
+        with mock.patch("asyncio.sleep", fake_sleep):
+            with self.assertLogs("mlx_lazyserve.telegram", level="INFO"):
+                await b._api_retrying("sendMessage", chat_id=1, text="hi")
+        self.assertEqual(len(self.attempts), 2)
+        self.assertEqual(slept, [14.0])
+
+    async def test_a_non_rate_error_is_not_retried(self):
+        b = self.bot_with([TelegramAPIError("sendMessage", "Bad Request", 400)])
+        with self.assertRaises(TelegramAPIError):
+            await b._api_retrying("sendMessage", chat_id=1, text="hi")
+        self.assertEqual(len(self.attempts), 1)
+
+    async def test_an_absurd_retry_after_is_refused_rather_than_slept_through(self):
+        # Waiting out a multi-hour limit would park the worker and stall every later reply.
+        b = self.bot_with([TelegramAPIError("sendMessage", "Too Many Requests", 429, 7200)])
+        with self.assertRaises(TelegramAPIError):
+            await b._api_retrying("sendMessage", chat_id=1, text="hi")
+        self.assertEqual(len(self.attempts), 1)
+
+
+class WedgedTimeout(Exception):
+    """Stands in for httpx's timeouts, whose distinguishing feature here is that they
+    stringify to nothing at all."""
+
+
+class PollRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    """A client whose proxy routing or connection pool has gone bad never recovers by
+    itself — every later poll fails identically until someone restarts the process. The
+    loop has to notice and rebuild it."""
+
+    def make(self, script):
+        b = bot()
+        self.rebuilds = []
+        self.stop = asyncio.Event()
+        self.script = list(script)
+
+        async def api(method, **kw):
+            if not self.script:
+                self.stop.set()
+                return []
+            if self.script.pop(0) == "fail":
+                raise WedgedTimeout()
+            return []
+
+        async def reset(why):
+            self.rebuilds.append(why)
+
+        async def sleep_or_stop(stop, secs):
+            return
+
+        b._api, b._reset_client, b._sleep_or_stop = api, reset, sleep_or_stop
+        return b
+
+    async def test_a_wedged_client_is_rebuilt_after_repeated_failures(self):
+        b = self.make(["fail", "fail", "fail"])
+        with self.assertLogs("mlx_lazyserve.telegram", level="WARNING"):
+            await b._poll_loop(self.stop)
+        self.assertEqual(len(self.rebuilds), 1)
+
+    async def test_the_empty_message_timeout_is_still_named_in_the_log(self):
+        # "getUpdates failed ()" is what made this invisible for a week.
+        b = self.make(["fail"])
+        with self.assertLogs("mlx_lazyserve.telegram", level="WARNING") as log:
+            await b._poll_loop(self.stop)
+        self.assertTrue(any("WedgedTimeout" in line for line in log.output), log.output)
+
+    async def test_the_odd_transient_failure_does_not_rebuild(self):
+        # Two failures, a success, two more: never three in a row, so nothing is wrong
+        # with the client and tearing it down would only lose the keepalive connection.
+        b = self.make(["fail", "fail", "ok", "fail", "fail"])
+        with self.assertLogs("mlx_lazyserve.telegram", level="WARNING"):
+            await b._poll_loop(self.stop)
+        self.assertEqual(self.rebuilds, [])
+
+
+class GetMeBootTests(unittest.IsolatedAsyncioTestCase):
+    """At boot this bot regularly wins the race against the proxy it needs to reach
+    Telegram. httpx resolves proxy settings once, at construction, so the client built
+    inside that window must not be the one the process keeps."""
+
+    def make(self, api):
+        b = bot()
+        self.rebuilds = []
+
+        async def reset(why):
+            self.rebuilds.append(why)
+
+        async def sleep_or_stop(stop, secs):
+            return
+
+        b._api, b._reset_client, b._sleep_or_stop = api, reset, sleep_or_stop
+        return b
+
+    async def test_the_client_is_rebuilt_between_retries(self):
+        calls = []
+
+        async def api(method, **kw):
+            calls.append(method)
+            if len(calls) < 3:
+                raise ConnectionError("All connection attempts failed")
+            return {"id": 1, "username": "x"}
+
+        b = self.make(api)
+        with self.assertLogs("mlx_lazyserve.telegram", level="WARNING"):
+            me = await b._getme_with_retry(asyncio.Event())
+        self.assertEqual(me["id"], 1)
+        self.assertEqual(len(self.rebuilds), 2)   # one per failed attempt
+
+    async def test_a_rejected_token_disables_the_bot_without_rebuilding(self):
+        async def api(method, **kw):
+            raise TelegramAPIError("getMe", "Unauthorized", 401)
+
+        b = self.make(api)
+        with self.assertLogs("mlx_lazyserve.telegram", level="ERROR"):
+            self.assertIsNone(await b._getme_with_retry(asyncio.Event()))
+        self.assertEqual(self.rebuilds, [])
+
+    async def test_a_stop_during_startup_does_not_rebuild(self):
+        # Shutting down mid-retry should not spin up a client nobody will close.
+        stop = asyncio.Event()
+
+        async def api(method, **kw):
+            stop.set()
+            raise ConnectionError("All connection attempts failed")
+
+        b = self.make(api)
+        with self.assertLogs("mlx_lazyserve.telegram", level="WARNING"):
+            self.assertIsNone(await b._getme_with_retry(stop))
+        self.assertEqual(self.rebuilds, [])
